@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// apkinfo: command-line front-end of the APK Lister core (used for testing).
+#include "analyzer.h"
+#include "plat.h"
+#include <cstdio>
+#include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#endif
+
+static int run(int argc, char** argv) {
+    const char* tab = "summary"; const char* file = nullptr; const char* icon_out = nullptr; bool nohash = false;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-m")) tab = "manifest";
+        else if (!strcmp(argv[i], "-f")) tab = "files";
+        else if (!strcmp(argv[i], "-a")) tab = "all";
+        else if (!strcmp(argv[i], "--nohash")) nohash = true;
+        else if (!strcmp(argv[i], "--icon") && i + 1 < argc) icon_out = argv[++i];
+        else file = argv[i];
+    }
+    if (!file) {
+        fprintf(stderr, "APK Lister %s - apkinfo\nusage: apkinfo [-m|-f|-a] [--nohash] [--icon out.png] FILE\n"
+                        "  FILE: .apk .aab .xapk .apks .apkm .apex\n  default: summary; -m decoded AndroidManifest.xml; -f file list; -a everything\n", apklister_version());
+        return 2;
+    }
+    MappedFile mf; std::string err;
+    if (!mf.open(file, err)) { fprintf(stderr, "%s: %s\n", file, err.c_str()); return 1; }
+    AnalyzeOptions opt; opt.hashes = !nohash;
+    opt.file_exists = [](const std::string& p) { return file_exists_utf8(p); };
+    Report r;
+    if (icon_out && !strcmp(tab, "summary") && nohash) opt.icon_only = false;
+    analyze(file, Bytes(mf.p, (size_t)mf.size), opt, r);
+    std::string out;
+    if (!strcmp(tab, "summary") || !strcmp(tab, "all")) out += "# " + r.title + "\n# " + r.subtitle + "\n\n" + r.summary;
+    if (!strcmp(tab, "manifest") || !strcmp(tab, "all")) out += r.manifest;
+    if (!strcmp(tab, "files") || !strcmp(tab, "all")) out += r.files;
+    fwrite(out.data(), 1, out.size(), stdout);
+    if (icon_out && !r.icon.empty()) { FILE* f = fopen(icon_out, "wb"); if (f) { fwrite(r.icon.data(), 1, r.icon.size(), f); fclose(f); } }
+    return r.ok ? 0 : 1;
+}
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** wargv) {
+    std::vector<std::string> a; std::vector<char*> p;
+    for (int i = 0; i < argc; i++) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string s(n > 0 ? n - 1 : 0, '\0');
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, &s[0], n, nullptr, nullptr);
+        a.push_back(s);
+    }
+    for (auto& s : a) p.push_back(&s[0]);
+    _setmode(_fileno(stdout), _O_BINARY);
+    return run(argc, p.data());
+}
+#else
+int main(int argc, char** argv) { return run(argc, argv); }
+#endif

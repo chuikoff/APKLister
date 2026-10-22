@@ -1,0 +1,1169 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Builds the text report for APK / AAB / XAPK / APKS / APKM / APEX files.
+#include "analyzer.h"
+#include "zip.h"
+#include "xml.h"
+#include "arsc.h"
+#include "apksig.h"
+#include "hash.h"
+#include "json.h"
+#include "proto.h"
+#include "tables.h"
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <memory>
+#include <set>
+
+const char* apklister_version() { return "0.1.0"; }
+
+namespace {
+
+const size_t KW = 32;
+struct Out {
+    std::string s;
+    void sec(const std::string& t) {
+        if (!s.empty()) s += "\n";
+        std::string h = "== " + t + " "; while (h.size() < 78) h += '=';
+        s += h + "\n";
+    }
+    void kv(const std::string& k, const std::string& v, int ind = 2) {
+        std::string l((size_t)ind, ' '); l += k;
+        if (l.size() < KW) l.append(KW - l.size(), ' '); else l += ' ';
+        s += l + v + "\n";
+    }
+    void line(const std::string& t, int ind = 2) { s += std::string((size_t)ind, ' ') + t + "\n"; }
+    void blank() { s += "\n"; }
+};
+
+std::string pad(const std::string& s, size_t w) { return s.size() >= w ? s + " " : s + std::string(w - s.size(), ' '); }
+std::string lpad(const std::string& s, size_t w) { return s.size() >= w ? s : std::string(w - s.size(), ' ') + s; }
+std::string short_size(uint64_t n) {
+    if (n < 1024) return strf("%llu B", (unsigned long long)n);
+    if (n < 1024 * 1024) return strf("%.1f KiB", n / 1024.0);
+    if (n < 1024ull * 1024 * 1024) return strf("%.2f MiB", n / 1048576.0);
+    return strf("%.2f GiB", n / 1073741824.0);
+}
+std::string api_str(int api) {
+    if (api < 0) return "-";
+    const char* n = android_version_name(api);
+    return n ? strf("%d (Android %s)", api, n) : strf("%d", api);
+}
+std::string basename_of(const std::string& p) { size_t k = p.find_last_of("/\\"); return k == std::string::npos ? p : p.substr(k + 1); }
+std::string ext_of(const std::string& p) { std::string b = basename_of(p); size_t k = b.rfind('.'); return k == std::string::npos ? "" : lower(b.substr(k + 1)); }
+
+struct Layout {
+    std::string manifest, resources, dex, lib, root, assets, res, file_prefix;
+    bool proto = false;
+};
+Layout apk_layout() { Layout l; l.manifest = "AndroidManifest.xml"; l.resources = "resources.arsc"; l.lib = "lib/"; l.assets = "assets/"; l.res = "res/"; return l; }
+Layout aab_layout(const std::string& m) {
+    Layout l; l.manifest = m + "manifest/AndroidManifest.xml"; l.resources = m + "resources.pb"; l.dex = m + "dex/"; l.lib = m + "lib/";
+    l.root = m + "root/"; l.assets = m + "assets/"; l.res = m + "res/"; l.file_prefix = m; l.proto = true; return l;
+}
+
+// ---- ELF quick look
+struct ElfInfo { bool ok = false; int cls = 0; int machine = 0; uint64_t min_align = 0; bool have_align = false; std::string ndk; int api = -1; };
+ElfInfo elf_info(Bytes b) {
+    ElfInfo e;
+    if (b.n < 52 || memcmp(b.p, "\x7f" "ELF", 4) != 0) return e;
+    e.cls = b.p[4]; if (b.p[5] != 1) return e; // little endian only
+    e.machine = rd16(b.p + 18);
+    uint64_t phoff; uint16_t phent, phnum;
+    if (e.cls == 2) { if (b.n < 64) return e; phoff = rd64(b.p + 32); phent = rd16(b.p + 54); phnum = rd16(b.p + 56); }
+    else { phoff = rd32(b.p + 28); phent = rd16(b.p + 42); phnum = rd16(b.p + 44); }
+    e.ok = true;
+    if (phnum > 256) return e;
+    for (uint16_t i = 0; i < phnum; i++) {
+        uint64_t o = phoff + (uint64_t)i * phent;
+        if (o > b.n || !b.has((size_t)o, e.cls == 2 ? 56 : 32)) break;
+        const uint8_t* p = b.p + o;
+        uint32_t type = rd32(p); uint64_t off, fsz, al;
+        if (e.cls == 2) { off = rd64(p + 8); fsz = rd64(p + 32); al = rd64(p + 48); }
+        else { off = rd32(p + 4); fsz = rd32(p + 16); al = rd32(p + 28); }
+        if (type == 1) { if (!e.have_align || al < e.min_align) e.min_align = al; e.have_align = true; }
+        if (type == 4 && off < b.n && fsz < b.n && b.has((size_t)off, (size_t)fsz)) {
+            Reader r(b.sub((size_t)off, (size_t)fsz));
+            while (r.left() >= 12) {
+                uint32_t nsz = r.u32(), dsz = r.u32(), nt = r.u32();
+                Bytes nm = r.take((nsz + 3) & ~3u), ds = r.take((dsz + 3) & ~3u);
+                if (!r.ok) break;
+                if (nsz == 8 && memcmp(nm.p, "Android", 8) == 0 && nt == 1 && dsz >= 4) {
+                    e.api = (int)rd32(ds.p);
+                    if (dsz >= 4 + 64) { const char* v = (const char*)ds.p + 4; e.ndk = sanitize_utf8(std::string(v, strnlen(v, 64))); }
+                    if (dsz >= 4 + 128) { const char* v = (const char*)ds.p + 68; std::string bn(v, strnlen(v, 64)); if (!bn.empty()) e.ndk += " (build " + sanitize_utf8(bn) + ")"; }
+                }
+            }
+        }
+    }
+    return e;
+}
+const char* elf_machine(int m) {
+    switch (m) { case 40: return "ARM"; case 183: return "AArch64"; case 3: return "x86"; case 62: return "x86-64"; case 8: return "MIPS"; case 243: return "RISC-V"; default: return "?"; }
+}
+
+struct TechRule { const char* group; const char* name; char kind; const char* pat; }; // kind: s=suffix, c=contains, p=prefix, d=dex string
+const TechRule kTech[] = {
+    {"Framework","Flutter",'s',"/libflutter.so"},{"Framework","Flutter",'c',"flutter_assets/"},{"Framework","Flutter",'d',"Lio/flutter/embedding/"},
+    {"Framework","React Native",'s',"/libreactnativejni.so"},{"Framework","React Native",'s',"/libreactnative.so"},{"Framework","React Native",'p',"assets/index.android.bundle"},{"Framework","React Native",'d',"Lcom/facebook/react/"},
+    {"Framework","Hermes JS engine",'s',"/libhermes.so"},{"Framework","JavaScriptCore",'s',"/libjsc.so"},{"Framework","Expo",'d',"Lexpo/modules/"},
+    {"Framework","Xamarin / .NET for Android",'s',"/libmonodroid.so"},{"Framework","Xamarin / .NET for Android",'s',"/libmonosgen-2.0.so"},{"Framework","Xamarin / .NET for Android",'p',"assemblies/"},
+    {"Framework",".NET MAUI",'c',"microsoft.maui"},{"Framework","Xamarin / .NET for Android",'d',"Lmono/android/"},
+    {"Framework","Unity",'s',"/libunity.so"},{"Framework","Unity (IL2CPP)",'s',"/libil2cpp.so"},{"Framework","Unity (Mono)",'p',"assets/bin/data/managed/"},{"Framework","Unity",'d',"Lcom/unity3d/player/"},
+    {"Framework","Unreal Engine",'s',"/libue4.so"},{"Framework","Unreal Engine",'s',"/libunreal.so"},
+    {"Framework","Godot",'s',"/libgodot_android.so"},{"Framework","Cocos2d-x",'s',"/libcocos2dcpp.so"},{"Framework","Cocos2d-x",'s',"/libcocos2djs.so"},{"Framework","Cocos",'s',"/libcocos.so"},
+    {"Framework","Defold",'s',"/libdmengine.so"},{"Framework","Solar2D (Corona)",'s',"/libcorona.so"},{"Framework","GameMaker",'s',"/libyoyo.so"},
+    {"Framework","Apache Cordova",'p',"assets/www/cordova.js"},{"Framework","Apache Cordova",'d',"Lorg/apache/cordova/"},
+    {"Framework","Capacitor (Ionic)",'p',"assets/capacitor.config.json"},{"Framework","Capacitor (Ionic)",'d',"Lcom/getcapacitor/"},
+    {"Framework","NativeScript",'s',"/libnativescript.so"},{"Framework","Qt",'c',"libqt5core"},{"Framework","Qt",'c',"libqt6core"},
+    {"Framework","Python (python-for-android/Kivy)",'c',"/libpython"},{"Framework","Python (Chaquopy)",'c',"chaquopy"},
+    {"Framework","Go (gomobile)",'s',"/libgojni.so"},{"Framework","Compose Multiplatform",'d',"Lorg/jetbrains/compose/"},
+    {"Framework","B4A (Basic4Android)",'d',"Lanywheresoftware/b4a/"},
+    {"Language","Kotlin",'p',"kotlin/"},{"Language","Kotlin",'s',".kotlin_module"},{"Language","Kotlin",'d',"Lkotlin/Metadata;"},
+    {"Language","C/C++ (NDK)",'s',".so"},
+    {"Jetpack","Jetpack Compose",'c',"meta-inf/androidx.compose."},{"Jetpack","Jetpack Compose",'d',"Landroidx/compose/runtime/"},
+    {"Jetpack","Room",'d',"Landroidx/room/"},{"Jetpack","WorkManager",'d',"Landroidx/work/"},{"Jetpack","Navigation",'d',"Landroidx/navigation/"},
+    {"Jetpack","Media3 / ExoPlayer",'d',"Landroidx/media3/"},{"Library","ExoPlayer 2",'d',"Lcom/google/android/exoplayer2/"},
+    {"Google","Firebase",'c',"firebase-"},{"Google","Firebase",'d',"Lcom/google/firebase/"},{"Google","Firebase Crashlytics",'d',"Lcom/google/firebase/crashlytics/"},
+    {"Google","Google Play Services",'c',"play-services-"},{"Google","Google Play Services",'d',"Lcom/google/android/gms/common/"},
+    {"Google","Google Mobile Ads (AdMob)",'d',"Lcom/google/android/gms/ads/"},{"Google","Play Core / In-app updates",'d',"Lcom/google/android/play/core/"},
+    {"Google","Material Components",'d',"Lcom/google/android/material/"},
+    {"Library","Kotlin Coroutines",'d',"Lkotlinx/coroutines/"},{"Library","kotlinx.serialization",'d',"Lkotlinx/serialization/"},
+    {"Library","OkHttp",'d',"Lokhttp3/"},{"Library","Retrofit",'d',"Lretrofit2/"},{"Library","Ktor",'d',"Lio/ktor/"},
+    {"Library","Gson",'d',"Lcom/google/gson/"},{"Library","Moshi",'d',"Lcom/squareup/moshi/"},{"Library","Jackson",'d',"Lcom/fasterxml/jackson/"},
+    {"Library","RxJava",'d',"Lio/reactivex/"},{"Library","Dagger",'d',"Ldagger/"},{"Library","Hilt",'d',"Ldagger/hilt/"},{"Library","Koin",'d',"Lorg/koin/"},
+    {"Library","Glide",'d',"Lcom/bumptech/glide/"},{"Library","Coil",'d',"Lcoil/"},{"Library","Coil 3",'d',"Lcoil3/"},{"Library","Picasso",'d',"Lcom/squareup/picasso/"},{"Library","Fresco",'d',"Lcom/facebook/drawee/"},
+    {"Library","Lottie",'d',"Lcom/airbnb/lottie/"},{"Library","ZXing",'d',"Lcom/google/zxing/"},{"Library","Bouncy Castle",'d',"Lorg/bouncycastle/"},
+    {"Library","Realm",'d',"Lio/realm/"},{"Library","SQLCipher",'d',"Lnet/sqlcipher/"},{"Library","EventBus",'d',"Lorg/greenrobot/eventbus/"},
+    {"Library","Timber",'d',"Ltimber/log/"},{"Library","Apache Commons",'d',"Lorg/apache/commons/"},
+    {"SDK","Sentry",'d',"Lio/sentry/"},{"SDK","AppsFlyer",'d',"Lcom/appsflyer/"},{"SDK","Adjust",'d',"Lcom/adjust/sdk/"},{"SDK","OneSignal",'d',"Lcom/onesignal/"},
+    {"SDK","Branch",'d',"Lio/branch/"},{"SDK","Amplitude",'d',"Lcom/amplitude/"},{"SDK","Mixpanel",'d',"Lcom/mixpanel/"},{"SDK","Facebook SDK",'d',"Lcom/facebook/FacebookSdk;"},
+    {"SDK","AppLovin",'d',"Lcom/applovin/"},{"SDK","ironSource",'d',"Lcom/ironsource/"},{"SDK","Unity Ads",'d',"Lcom/unity3d/ads/"},{"SDK","myTarget",'d',"Lcom/my/target/"},
+    {"SDK","Yandex Mobile Ads",'d',"Lcom/yandex/mobile/ads/"},{"SDK","AppMetrica",'d',"Lio/appmetrica/"},{"SDK","AppMetrica (legacy)",'d',"Lcom/yandex/metrica/"},
+    {"SDK","VK SDK",'d',"Lcom/vk/api/sdk/"},{"SDK","Huawei HMS",'d',"Lcom/huawei/hms/"},{"SDK","RuStore SDK",'d',"Lru/rustore/sdk/"},
+    {"SDK","Microsoft App Center",'d',"Lcom/microsoft/appcenter/"},{"SDK","Bugsnag",'d',"Lcom/bugsnag/"},{"SDK","Datadog",'d',"Lcom/datadog/"},
+    {"Protector","Qihoo 360 Jiagu",'c',"libjiagu"},{"Protector","Bangcle / SecNeo",'s',"/libsecexe.so"},{"Protector","Bangcle / SecNeo",'s',"/libdexhelper.so"},
+    {"Protector","Tencent Legu",'c',"libshella"},{"Protector","Tencent Legu",'c',"libshellx"},{"Protector","Ijiami",'p',"assets/ijiami"},{"Protector","Baidu protect",'s',"/libbaiduprotect.so"},
+    {"Protector","NetEase Yidun",'s',"/libnesec.so"},{"Protector","DexProtector",'c',"libdexprotector"},{"Protector","AppSealing",'c',"appsealing"},
+    {"Protector","Promon SHIELD",'c',"libshield"},
+};
+
+class ApkAnalyzer {
+public:
+    const Zip& z; Layout L; const AnalyzeOptions& opt; Report& rep;
+    XDoc doc; std::unique_ptr<Resources> res; std::vector<uint8_t> res_store;
+    std::string pkg, label, version_name, version_code, manifest_err, res_err;
+    int min_sdk = -1, target_sdk = -1, max_sdk = -1, compile_sdk = -1;
+    std::set<std::string> dex_hits;
+    std::vector<std::string> norm_names; // lower-cased names normalized to APK layout
+
+    ApkAnalyzer(const Zip& zz, Layout l, const AnalyzeOptions& o, Report& r) : z(zz), L(l), opt(o), rep(r) {}
+
+    const XNode* root() const { return doc.root.get(); }
+    const XNode* app() const { return doc.root ? doc.root->child("application") : nullptr; }
+
+    bool load() {
+        std::vector<uint8_t> buf;
+        const ZipEntry* me = z.find(L.manifest);
+        if (!me) { manifest_err = L.manifest + " not found"; return false; }
+        Bytes mb; std::string err;
+        if (!z.read(*me, buf, mb, 64u << 20, err)) { manifest_err = "cannot read manifest: " + err; return false; }
+        bool okm = L.proto ? parse_proto_xml(mb, doc) : parse_axml(mb, doc);
+        if (!okm) {
+            XDoc d2; bool ok2 = L.proto ? parse_axml(mb, d2) : parse_proto_xml(mb, d2);
+            if (ok2) doc = std::move(d2);
+            else { manifest_err = doc.error.empty() ? "cannot decode manifest" : doc.error; return false; }
+        }
+        const ZipEntry* re = z.find(L.resources);
+        if (re) {
+            std::vector<uint8_t> rb; Bytes rv;
+            if (z.read(*re, rb, rv, 256u << 20, err)) {
+                if (rv.p == rb.data()) { res_store.swap(rb); rv = Bytes(res_store); }
+                res.reset(L.proto ? load_resources_pb(rv, res_err) : load_arsc(rv, res_err));
+            } else res_err = err;
+        }
+        const XNode* m = root();
+        pkg = val(m, "package");
+        version_name = val(m, "versionName");
+        version_code = val(m, "versionCode", false);
+        if (const XAttr* vm = m->attr("versionCodeMajor")) {
+            uint64_t full = ((uint64_t)vm->data << 32) | (uint32_t)strtoul(version_code.c_str(), nullptr, 10);
+            version_code = strf("%llu", (unsigned long long)full);
+        }
+        label = app() ? val(app(), "label") : std::string();
+        if (const XNode* us = m->child("uses-sdk")) {
+            min_sdk = ival(us, "minSdkVersion", -1); target_sdk = ival(us, "targetSdkVersion", -1); max_sdk = ival(us, "maxSdkVersion", -1);
+        }
+        if (min_sdk < 0) min_sdk = 1;
+        if (target_sdk < 0) target_sdk = min_sdk;
+        compile_sdk = ival(m, "compileSdkVersion", -1);
+        for (auto& e : z.entries) norm_names.push_back(lower(norm(e.name)));
+        return true;
+    }
+
+    std::string norm(const std::string& n) const {
+        if (L.file_prefix.empty()) return n;
+        if (!L.root.empty() && starts_with(n, L.root.c_str())) return n.substr(L.root.size());
+        if (!L.dex.empty() && starts_with(n, L.dex.c_str())) return n.substr(L.dex.size());
+        if (starts_with(n, L.file_prefix.c_str())) return n.substr(L.file_prefix.size());
+        return n;
+    }
+
+    const XAttr* A(const XNode* n, const char* nm) const { return n ? n->attr(nm) : nullptr; }
+    std::string val(const XNode* n, const char* nm, bool resolve = true) const {
+        const XAttr* a = A(n, nm); if (!a) return "";
+        if (resolve && res && (a->type == RT_REFERENCE || a->type == RT_DYN_REF) && a->data && (a->data >> 24) != 0x01) {
+            std::string s = res->best_string(a->data); if (!s.empty()) return sanitize_utf8(s);
+        }
+        return sanitize_utf8(format_value(*a, res.get()));
+    }
+    std::string valr(const XNode* n, const char* nm) const { // "resolved   (@type/name)"
+        const XAttr* a = A(n, nm); if (!a) return "";
+        std::string raw = format_value(*a, res.get());
+        if (a->type == RT_REFERENCE || a->type == RT_DYN_REF) {
+            std::string r = val(n, nm);
+            if (r != raw) return r + "   (" + raw + ")";
+        }
+        return sanitize_utf8(raw);
+    }
+    int ival(const XNode* n, const char* nm, int def) const {
+        const XAttr* a = A(n, nm); if (!a) return def;
+        if (a->type == RT_INT_DEC || a->type == RT_INT_HEX) return (int)a->data;
+        if (a->type == RT_REFERENCE && res) { for (auto& v : res->values(a->data)) if (v.type == RT_INT_DEC || v.type == RT_INT_HEX) return (int)v.data; }
+        if (!a->str.empty() && (isdigit((unsigned char)a->str[0]) || a->str[0] == '-')) return atoi(a->str.c_str());
+        if (!a->str.empty()) return 10000; // preview codename
+        return def;
+    }
+    int bval(const XNode* n, const char* nm) const { // -1 absent, -2 unresolvable
+        const XAttr* a = A(n, nm); if (!a) return -1;
+        if (a->type == RT_BOOL) return a->data ? 1 : 0;
+        if (a->type == RT_REFERENCE && res) { bool b; if (res->resolve_bool(a->data, b)) return b ? 1 : 0; }
+        if (a->str == "true") return 1;
+        if (a->str == "false") return 0;
+        return -2;
+    }
+    std::string bstr(const XNode* n, const char* nm, const char* def_note) const {
+        int b = bval(n, nm);
+        if (b == 1) return "true";
+        if (b == 0) return "false";
+        if (b == -2) return valr(n, nm);
+        return std::string("(not set") + (def_note ? std::string("; default ") + def_note : std::string()) + ")";
+    }
+    std::string cls(const std::string& n) const {
+        if (n.empty()) return n;
+        if (n[0] == '.') return pkg + n;
+        if (n.find('.') == std::string::npos) return pkg + "." + n;
+        return n;
+    }
+
+    // ------------------------------------------------------------ icon
+    void find_icon() {
+        const XNode* a = app();
+        if (!a || !res) { fallback_icon(); return; }
+        std::vector<uint32_t> ids;
+        for (const char* nm : { "icon", "roundIcon" }) {
+            const XAttr* x = A(a, nm);
+            if (x && (x->type == RT_REFERENCE || x->type == RT_DYN_REF) && x->data) ids.push_back(x->data);
+        }
+        for (uint32_t id : ids) {
+            std::vector<uint32_t> todo{ id }; std::set<uint32_t> seen;
+            while (!todo.empty() && seen.size() < 16) {
+                uint32_t cur = todo.back(); todo.pop_back();
+                if (!seen.insert(cur).second) continue;
+                auto vals = res->values(cur);
+                int best = -1; uint16_t bd = 0;
+                for (size_t i = 0; i < vals.size(); i++) {
+                    auto& v = vals[i];
+                    if (v.type == RT_REFERENCE && v.data) { todo.push_back(v.data); continue; }
+                    std::string e = ext_of(v.str);
+                    if (e != "png" && e != "webp" && e != "jpg" && e != "jpeg") continue;
+                    uint16_t d = v.cfg.density >= 0xFFFE ? 1 : v.cfg.density;
+                    if (best < 0 || d > bd) { best = (int)i; bd = d; }
+                }
+                if (best >= 0) {
+                    std::string path = L.file_prefix + vals[best].str;
+                    if (z.read_small(path, rep.icon, 16u << 20)) { rep.icon_path = vals[best].str + " (" + vals[best].cfg.desc + ")"; return; }
+                }
+                // adaptive icon XML: follow its foreground drawable
+                for (auto& v : vals) {
+                    if (ext_of(v.str) != "xml") continue;
+                    std::vector<uint8_t> xb;
+                    if (!z.read_small(L.file_prefix + v.str, xb, 1u << 20)) continue;
+                    XDoc xd; bool ok = L.proto ? parse_proto_xml(Bytes(xb), xd) : parse_axml(Bytes(xb), xd);
+                    if (!ok) continue;
+                    for (auto& k : xd.root->kids) {
+                        if (k->name != "foreground") continue;
+                        const XAttr* d = k->attr("drawable");
+                        if (d && d->type == RT_REFERENCE) todo.insert(todo.begin(), d->data);
+                    }
+                }
+            }
+        }
+        fallback_icon();
+    }
+    void fallback_icon() {
+        const ZipEntry* best = nullptr; int bestScore = -100;
+        for (auto& e : z.entries) {
+            std::string n = lower(e.name);
+            if (n.find("ic_launcher") == std::string::npos && n.find("app_icon") == std::string::npos) continue;
+            std::string ex = ext_of(n);
+            if (ex != "png" && ex != "webp") continue;
+            int sc = n.find("xxxhdpi") != std::string::npos ? 5 : n.find("xxhdpi") != std::string::npos ? 4 : n.find("xhdpi") != std::string::npos ? 3 : n.find("hdpi") != std::string::npos ? 2 : 1;
+            if (n.find("foreground") != std::string::npos || n.find("background") != std::string::npos) sc -= 10;
+            if (sc > bestScore) { bestScore = sc; best = &e; }
+        }
+        if (best && z.read_small(best->name, rep.icon, 16u << 20)) rep.icon_path = best->name + " (by file name)";
+    }
+
+    // ------------------------------------------------------------ PACKAGE
+    void package_section(Out& o) {
+        const XNode* m = root(); const XNode* a = app();
+        o.sec("PACKAGE");
+        o.kv("Package name", pkg.empty() ? "-" : pkg);
+        o.kv("Application label", a && A(a, "label") ? valr(a, "label") : "-");
+        if (res && a && A(a, "label") && A(a, "label")->type == RT_REFERENCE) {
+            auto vals = res->values(A(a, "label")->data);
+            std::string loc; int c = 0;
+            for (auto& v : vals) { if (v.cfg.locale.empty() || v.str.empty()) continue; if (c++ < 12) loc += (loc.empty() ? "" : ", ") + v.cfg.locale + "=" + sanitize_utf8(v.str); }
+            if (c) o.kv("Localized labels", strf("%d", c) + ": " + loc + (c > 12 ? ", ..." : ""));
+        }
+        o.kv("Version name", version_name.empty() ? "-" : (A(m, "versionName") && A(m, "versionName")->type == RT_REFERENCE ? valr(m, "versionName") : version_name));
+        o.kv("Version code", version_code.empty() ? "-" : version_code);
+        o.kv("Min SDK", api_str(min_sdk));
+        o.kv("Target SDK", api_str(target_sdk));
+        o.kv("Max SDK", max_sdk < 0 ? "-" : api_str(max_sdk));
+        std::string cs = A(m, "compileSdkVersion") ? api_str(compile_sdk) : "-";
+        if (A(m, "compileSdkVersionCodename")) cs += "  codename " + val(m, "compileSdkVersionCodename");
+        o.kv("Compile SDK", cs);
+        if (A(m, "platformBuildVersionCode") || A(m, "platformBuildVersionName"))
+            o.kv("Platform build version", val(m, "platformBuildVersionCode") + " / " + val(m, "platformBuildVersionName"));
+        int il = ival(m, "installLocation", -1);
+        o.kv("Install location", il < 0 ? "(not set; default internalOnly)" : il == 0 ? "auto" : il == 1 ? "internalOnly" : il == 2 ? "preferExternal" : strf("%d", il));
+        o.kv("Shared user ID", A(m, "sharedUserId") ? val(m, "sharedUserId") : "-");
+        if (A(m, "sharedUserLabel")) o.kv("Shared user label", valr(m, "sharedUserLabel"));
+        if (A(m, "sharedUserMaxSdkVersion")) o.kv("sharedUserMaxSdkVersion", val(m, "sharedUserMaxSdkVersion"));
+        if (A(m, "split")) o.kv("Split name", val(m, "split"));
+        if (A(m, "isFeatureSplit")) o.kv("Feature split", val(m, "isFeatureSplit"));
+        if (A(m, "isSplitRequired")) o.kv("Split required", val(m, "isSplitRequired"));
+        if (A(m, "requiredSplitTypes")) o.kv("Required split types", val(m, "requiredSplitTypes"));
+        if (A(m, "splitTypes")) o.kv("Split types", val(m, "splitTypes"));
+        if (!a) { o.line("(no <application> element)"); return; }
+        o.blank();
+        o.kv("Application class", A(a, "name") ? cls(val(a, "name")) : "(default android.app.Application)");
+        o.kv("appComponentFactory", A(a, "appComponentFactory") ? val(a, "appComponentFactory") : "-");
+        o.kv("Icon", A(a, "icon") ? valr(a, "icon") : "-");
+        if (A(a, "roundIcon")) o.kv("Round icon", valr(a, "roundIcon"));
+        if (!rep.icon_path.empty()) o.kv("Icon file used", rep.icon_path);
+        o.kv("Theme", A(a, "theme") ? valr(a, "theme") : "-");
+        o.kv("debuggable", bstr(a, "debuggable", "false"));
+        o.kv("allowBackup", bstr(a, "allowBackup", "true"));
+        o.kv("usesCleartextTraffic", bstr(a, "usesCleartextTraffic", target_sdk >= 28 ? "false (targetSdk>=28)" : "true (targetSdk<28)"));
+        o.kv("networkSecurityConfig", A(a, "networkSecurityConfig") ? valr(a, "networkSecurityConfig") : "-");
+        o.kv("extractNativeLibs", bstr(a, "extractNativeLibs", "true"));
+        o.kv("largeHeap", bstr(a, "largeHeap", "false"));
+        o.kv("testOnly", bstr(a, "testOnly", "false"));
+        o.kv("requestLegacyExternalStorage", bstr(a, "requestLegacyExternalStorage", "false"));
+        o.kv("hasCode", bstr(a, "hasCode", "true"));
+        o.kv("supportsRtl", bstr(a, "supportsRtl", "false"));
+        if (A(a, "fullBackupContent")) o.kv("fullBackupContent", valr(a, "fullBackupContent"));
+        if (A(a, "dataExtractionRules")) o.kv("dataExtractionRules", valr(a, "dataExtractionRules"));
+        if (A(a, "localeConfig")) o.kv("localeConfig", valr(a, "localeConfig"));
+        if (A(a, "process")) o.kv("process", val(a, "process"));
+        static const char* known[] = { "name","label","icon","roundIcon","theme","debuggable","allowBackup","usesCleartextTraffic","networkSecurityConfig",
+            "extractNativeLibs","largeHeap","testOnly","requestLegacyExternalStorage","hasCode","supportsRtl","fullBackupContent","dataExtractionRules",
+            "localeConfig","process","appComponentFactory", nullptr };
+        std::vector<std::pair<std::string, std::string>> other;
+        for (auto& x : a->attrs) {
+            bool k = false; for (int i = 0; known[i]; i++) if (x.name == known[i]) k = true;
+            if (!k) other.push_back({ x.name, sanitize_utf8(format_value(x, res.get())) });
+        }
+        if (!other.empty()) { o.line("Other <application> attributes:"); for (auto& p : other) o.kv(p.first, p.second, 4); }
+        static const char* mknown[] = { "package","versionCode","versionName","versionCodeMajor","compileSdkVersion","compileSdkVersionCodename",
+            "platformBuildVersionCode","platformBuildVersionName","installLocation","sharedUserId","sharedUserLabel","sharedUserMaxSdkVersion",
+            "split","isFeatureSplit","isSplitRequired","requiredSplitTypes","splitTypes", nullptr };
+        other.clear();
+        for (auto& x : m->attrs) {
+            bool k = false; for (int i = 0; mknown[i]; i++) if (x.name == mknown[i]) k = true;
+            if (!k) other.push_back({ x.name, sanitize_utf8(format_value(x, res.get())) });
+        }
+        if (!other.empty()) { o.line("Other <manifest> attributes:"); for (auto& p : other) o.kv(p.first, p.second, 4); }
+    }
+
+    // ------------------------------------------------------------ SIGNATURES
+    void cert_lines(Out& o, const CertInfo& c, int ind) {
+        if (!c.ok) { o.line("certificate: " + c.error, ind); return; }
+        o.kv("Subject", c.subject, ind);
+        o.kv("Issuer", c.self_signed ? "(self-signed)" : c.issuer, ind);
+        o.kv("Serial number", "0x" + c.serial_hex + (!c.serial_dec.empty() && c.serial_dec.size() < 40 ? "  (" + c.serial_dec + ")" : ""), ind);
+        o.kv("Valid from", c.not_before, ind);
+        o.kv("Valid until", c.not_after, ind);
+        std::string k = c.key_alg; if (c.key_bits) k += strf(" %d-bit", c.key_bits); if (!c.curve.empty()) k += " " + c.curve;
+        o.kv("Public key", k, ind);
+        o.kv("Signature algorithm", c.sig_alg + strf("  (X.509 v%d, %zu bytes)", c.version, c.der_size), ind);
+        o.kv("SHA-256", c.sha256, ind);
+        o.kv("SHA-1", c.sha1, ind);
+        o.kv("MD5", c.md5, ind);
+        o.kv("Public key SHA-256", c.pubkey_sha256, ind);
+        if (c.subject.find("CN=Android Debug") != std::string::npos) o.line("!! This is the Android DEBUG certificate", ind);
+    }
+
+    void signers(Out& o, const char* scheme, const std::vector<SigSigner>& v) {
+        for (size_t i = 0; i < v.size(); i++) {
+            auto& s = v[i];
+            o.line(strf("%s signer #%zu:", scheme, i + 1));
+            if (s.min_sdk >= 0) o.kv("SDK range", strf("%d .. ", s.min_sdk) + (s.max_sdk == 0x7fffffff ? std::string("any") : strf("%d", s.max_sdk)), 4);
+            std::string al; for (auto x : s.sig_algs) al += (al.empty() ? "" : ", ") + sig_alg_name(x);
+            o.kv("Signature algorithms", al.empty() ? "-" : al, 4);
+            for (auto& at : s.attrs) {
+                const char* n = at.first == 0x3ba06f8c ? "proof-of-rotation (key lineage)" : at.first == 0x559f8b02 ? "rotation-min-sdk-version" :
+                    at.first == 0xc2a6b3ba ? "rotation-on-dev-release" : at.first == 0xbeeff00d ? "stripping protection (v3 present)" : "attribute";
+                o.kv("Attribute", strf("0x%08x %s (%zu bytes)", at.first, n, at.second), 4);
+            }
+            for (size_t k = 0; k < s.certs.size(); k++) { if (s.certs.size() > 1) o.line(strf("certificate %zu:", k + 1), 4); cert_lines(o, s.certs[k], 4); }
+            if (!s.lineage.empty()) {
+                o.line(strf("Key rotation lineage (%zu certificates, oldest first):", s.lineage.size()), 4);
+                for (auto& c : s.lineage) o.line(c.subject + "  SHA-256 " + c.sha256, 6);
+            }
+            if (!s.error.empty()) o.line("error: " + s.error, 4);
+        }
+    }
+
+    void sig_section(Out& o, const std::string& display_path, bool is_aab) {
+        SigInfo si;
+        analyze_signatures(z, is_aab ? std::string() : L.root, si);
+        if (opt.file_exists && !display_path.empty() && opt.file_exists(display_path + ".idsig")) { si.v4 = true; si.idsig_note = display_path + ".idsig"; }
+        o.sec("SIGNATURES");
+        if (is_aab) o.line("(App bundles carry a JAR signature made with the upload key; Play re-signs the generated APKs.)");
+        auto yn = [](bool b) { return b ? std::string("yes") : std::string("no"); };
+        o.kv("v1 (JAR signing)", yn(si.v1));
+        o.kv("v2 (APK Signature Scheme v2)", yn(si.v2));
+        o.kv("v3 (APK Signature Scheme v3)", yn(si.v3));
+        o.kv("v3.1 (rotation targeting)", yn(si.v31));
+        o.kv("v4 (.idsig, incremental)", si.v4 ? "yes: " + basename_of(si.idsig_note) : std::string("no (no .idsig file next to the file)"));
+        o.kv("Source stamp", si.stamp ? std::string("yes") : (si.stamp_file_sha256.empty() ? std::string("no") : std::string("stamp-cert-sha256 file only")));
+        o.line("(signatures are parsed, not cryptographically verified)");
+        if (z.has_sig_block) {
+            o.kv("APK Signing Block", strf("offset %llu, %s", (unsigned long long)z.sig_block_off, short_size(z.sig_block_size).c_str()));
+            for (auto& b : si.blocks) o.line(strf("block 0x%08x  %-38s %s", b.first, sig_block_name(b.first), short_size(b.second).c_str()), 4);
+        }
+        std::set<std::string> fps;
+        for (auto& f : si.v1files) for (auto& c : f.certs) fps.insert(c.sha256);
+        for (auto* v : { &si.v2s, &si.v3s, &si.v31s }) for (auto& s : *v) for (auto& c : s.certs) fps.insert(c.sha256);
+        if (fps.size() > 1) o.kv("Distinct signing certs", strf("%zu (key rotation or multiple signers)", fps.size()));
+        else if (fps.size() == 1) o.kv("Signing certificate", "same certificate in all present schemes");
+        if (si.v1 || !si.v1files.empty() || !si.manifest_headers.empty()) {
+            o.line("v1 / JAR signature:");
+            for (auto& h : si.manifest_headers) o.kv("MANIFEST.MF " + h.first, sanitize_utf8(h.second), 4);
+            if (!si.manifest_headers.empty()) o.kv("MANIFEST.MF entries", strf("%zu", si.manifest_entries), 4);
+            for (auto& f : si.v1files) {
+                o.line(f.name + " (" + f.kind + ")", 4);
+                for (auto& h : f.headers) o.kv(h.first, sanitize_utf8(h.second), 6);
+                if (!f.error.empty()) o.line("error: " + f.error, 6);
+                for (auto& c : f.certs) cert_lines(o, c, 6);
+            }
+        }
+        if (si.v2) signers(o, "v2", si.v2s);
+        if (si.v3) signers(o, "v3", si.v3s);
+        if (si.v31) signers(o, "v3.1", si.v31s);
+        if (si.stamp || !si.stamp_file_sha256.empty()) {
+            o.line("Source stamp:");
+            if (!si.stamp_file_sha256.empty()) o.kv("stamp-cert-sha256", si.stamp_file_sha256, 4);
+            for (auto& c : si.stamp_certs) cert_lines(o, c, 4);
+        }
+    }
+
+    // ------------------------------------------------------------ PERMISSIONS / FEATURES
+    void perms_section(Out& o) {
+        const XNode* m = root();
+        std::vector<const XNode*> up = m->children("uses-permission");
+        for (auto* x : m->children("uses-permission-sdk-23")) up.push_back(x);
+        for (auto* x : m->children("uses-permission-sdk-m")) up.push_back(x);
+        o.sec(strf("PERMISSIONS (%zu requested)", up.size()));
+        std::map<std::string, int> cnt;
+        for (auto* p : up) {
+            std::string n = val(p, "name");
+            const char* c = permission_class(n);
+            cnt[c ? c : "other/custom"]++;
+            std::string ex;
+            if (p->name != "uses-permission") ex += "  [" + p->name + "]";
+            if (A(p, "maxSdkVersion")) ex += "  maxSdkVersion=" + val(p, "maxSdkVersion");
+            if (A(p, "minSdkVersion")) ex += "  minSdkVersion=" + val(p, "minSdkVersion");
+            if (const XAttr* f = A(p, "usesPermissionFlags")) ex += (f->data & 0x10000) ? std::string("  neverForLocation") : "  usesPermissionFlags=" + val(p, "usesPermissionFlags");
+            if (A(p, "requiredFeature")) ex += "  requiredFeature=" + val(p, "requiredFeature");
+            o.line(pad(n, 58) + pad(c ? c : "", 21) + ex);
+        }
+        if (!cnt.empty()) {
+            std::string s; for (auto& kv : cnt) s += (s.empty() ? "" : ", ") + strf("%d %s", kv.second, kv.first.c_str());
+            o.kv("By protection class", s);
+        }
+        auto decl = m->children("permission");
+        if (!decl.empty()) {
+            o.line(strf("Declared permissions (%zu):", decl.size()));
+            for (auto* p : decl) {
+                const XAttr* pl = A(p, "protectionLevel");
+                o.line(pad(val(p, "name"), 58) + (pl ? protection_level_string(pl->data) : std::string("normal")) + (A(p, "permissionGroup") ? "  group=" + val(p, "permissionGroup") : ""), 4);
+            }
+        }
+        for (const char* t : { "permission-group", "permission-tree" }) {
+            auto v = m->children(t);
+            if (!v.empty()) { o.line(strf("<%s> (%zu):", t, v.size())); for (auto* p : v) o.line(val(p, "name"), 4); }
+        }
+    }
+
+    std::string attr_list(const XNode* x) const {
+        std::string s; for (auto& a : x->attrs) s += (s.empty() ? "" : "  ") + a.name + "=" + sanitize_utf8(format_value(a, res.get()));
+        return s;
+    }
+
+    void features_section(Out& o) {
+        const XNode* m = root();
+        auto f = m->children("uses-feature");
+        o.sec(strf("FEATURES (%zu)", f.size()));
+        for (auto* x : f) {
+            std::string reqs = bval(x, "required") == 0 ? "optional" : "required";
+            if (A(x, "glEsVersion")) {
+                uint32_t v = A(x, "glEsVersion")->data;
+                o.line(pad(strf("OpenGL ES %u.%u", v >> 16, v & 0xFFFF), 58) + reqs);
+            } else o.line(pad(val(x, "name"), 58) + reqs + (A(x, "version") ? "  version=" + val(x, "version") : ""));
+        }
+        for (const char* t : { "supports-screens", "compatible-screens", "uses-configuration", "supports-gl-texture" }) {
+            for (auto* x : m->children(t)) {
+                std::string s = attr_list(x);
+                o.kv("<" + std::string(t) + ">", s.empty() ? "(no attributes)" : s);
+                for (auto& k : x->kids) o.line("<" + k->name + "> " + attr_list(k.get()), 4);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ COMPONENTS
+    std::string enum_str(const char* nm, uint32_t v, const std::string& raw) const {
+        if (!strcmp(nm, "launchMode")) { static const char* lm[] = { "standard", "singleTop", "singleTask", "singleInstance", "singleInstancePerTask" }; return v < 5 ? lm[v] : raw; }
+        if (!strcmp(nm, "documentLaunchMode")) { static const char* d[] = { "none", "intoExisting", "always", "never" }; return v < 4 ? d[v] : raw; }
+        if (!strcmp(nm, "screenOrientation")) {
+            static const char* so[] = { "landscape","portrait","user","behind","sensor","nosensor","sensorLandscape","sensorPortrait","reverseLandscape","reversePortrait","fullSensor","userLandscape","userPortrait","fullUser","locked" };
+            if (v == 0xFFFFFFFF) return "unspecified";
+            return v < 15 ? so[v] : raw;
+        }
+        if (!strcmp(nm, "foregroundServiceType")) {
+            static const struct { uint32_t f; const char* n; } t[] = { {1,"dataSync"},{2,"mediaPlayback"},{4,"phoneCall"},{8,"location"},{16,"connectedDevice"},{32,"mediaProjection"},
+                {64,"camera"},{128,"microphone"},{256,"health"},{512,"remoteMessaging"},{1024,"systemExempted"},{2048,"shortService"},{4096,"fileManagement"},{8192,"mediaProcessing"},{0x40000000,"specialUse"} };
+            if (v == 0) return "none";
+            std::string s; for (auto& x : t) if (v & x.f) s += (s.empty() ? "" : "|") + std::string(x.n);
+            return s.empty() ? raw : s;
+        }
+        if (!strcmp(nm, "configChanges")) {
+            static const struct { uint32_t f; const char* n; } t[] = { {1,"mcc"},{2,"mnc"},{4,"locale"},{8,"touchscreen"},{16,"keyboard"},{32,"keyboardHidden"},{64,"navigation"},
+                {128,"orientation"},{256,"screenLayout"},{512,"uiMode"},{1024,"screenSize"},{2048,"smallestScreenSize"},{4096,"density"},{8192,"layoutDirection"},
+                {0x4000,"colorMode"},{0x8000,"grammaticalGender"},{0x10000000,"fontWeightAdjustment"},{0x40000000,"fontScale"} };
+            std::string s; for (auto& x : t) if (v & x.f) s += (s.empty() ? "" : "|") + std::string(x.n);
+            return s.empty() ? raw : s;
+        }
+        return raw;
+    }
+
+    void component(Out& o, const XNode* c, const std::string& kind) {
+        bool launcher = false, has_filters = false;
+        for (auto* f : c->children("intent-filter")) {
+            has_filters = true;
+            bool mn = false, lc = false;
+            for (auto* a : f->children("action")) if (val(a, "name") == "android.intent.action.MAIN") mn = true;
+            for (auto* a : f->children("category")) { std::string n = val(a, "name"); if (n == "android.intent.category.LAUNCHER" || n == "android.intent.category.LEANBACK_LAUNCHER") lc = true; }
+            if (mn && lc) launcher = true;
+        }
+        std::string flags;
+        if (launcher) flags += " [LAUNCHER]";
+        int ex = bval(c, "exported");
+        if (ex == 1) flags += " exported";
+        else if (ex == 0) flags += " not-exported";
+        else {
+            bool implicit = kind == "provider" ? target_sdk < 17 : has_filters;
+            if (implicit) flags += (target_sdk >= 31 && kind != "provider") ? " exported(implicit; android:exported MISSING, required for targetSdk>=31)" : " exported(implicit)";
+        }
+        if (bval(c, "enabled") == 0) flags += " disabled";
+        o.line("* " + cls(val(c, "name")) + flags, 4);
+        static const char* show[] = { "targetActivity","permission","process","launchMode","taskAffinity","screenOrientation","authorities","grantUriPermissions",
+            "readPermission","writePermission","foregroundServiceType","isolatedProcess","directBootAware","multiprocess","initOrder","syncable",
+            "excludeFromRecents","noHistory","documentLaunchMode","resizeableActivity","supportsPictureInPicture","showWhenLocked","turnScreenOn",
+            "allowTaskReparenting","alwaysRetainTaskState","stopWithTask","externalService","enableOnBackInvokedCallback","configChanges","windowSoftInputMode", nullptr };
+        std::string attrs;
+        for (int i = 0; show[i]; i++) {
+            const XAttr* x = A(c, show[i]); if (!x) continue;
+            std::string v = format_value(*x, res.get());
+            if (x->type == RT_INT_DEC || x->type == RT_INT_HEX) v = enum_str(show[i], x->data, v);
+            attrs += (attrs.empty() ? "" : "  ") + std::string(show[i]) + "=" + sanitize_utf8(v);
+        }
+        if (!attrs.empty()) o.line(attrs, 8);
+        for (auto* f : c->children("intent-filter")) {
+            std::string h = "intent-filter";
+            if (A(f, "priority")) h += " priority=" + val(f, "priority");
+            if (A(f, "autoVerify")) h += " autoVerify=" + val(f, "autoVerify");
+            if (A(f, "label")) h += " label=" + val(f, "label");
+            o.line(h + ":", 8);
+            for (auto* a : f->children("action")) o.line("action    " + val(a, "name"), 10);
+            for (auto* a : f->children("category")) o.line("category  " + val(a, "name"), 10);
+            for (auto* d : f->children("data")) o.line("data      " + attr_list(d), 10);
+        }
+        for (auto* md : c->children("meta-data")) o.line("meta-data " + val(md, "name", false) + " = " + (A(md, "value") ? valr(md, "value") : A(md, "resource") ? valr(md, "resource") : std::string()), 8);
+        for (auto* pp : c->children("path-permission")) o.line("path-permission  " + attr_list(pp), 8);
+        for (auto* g : c->children("grant-uri-permission")) o.line("grant-uri-permission  " + attr_list(g), 8);
+        for (auto* p : c->children("property")) o.line("property " + val(p, "name", false) + " = " + (A(p, "value") ? valr(p, "value") : valr(p, "resource")), 8);
+    }
+
+    void components_section(Out& o) {
+        const XNode* a = app(); if (!a) return;
+        struct K { const char* tag; const char* title; } kinds[] = { {"activity","Activities"},{"activity-alias","Activity aliases"},{"service","Services"},{"receiver","Broadcast receivers"},{"provider","Content providers"} };
+        size_t total = 0; for (auto& k : kinds) total += a->children(k.tag).size();
+        o.sec(strf("COMPONENTS (%zu)", total));
+        for (auto& k : kinds) {
+            auto v = a->children(k.tag);
+            if (v.empty()) continue;
+            size_t exported = 0;
+            for (auto* c : v) { int e = bval(c, "exported"); if (e == 1 || (e < 0 && !c->children("intent-filter").empty() && strcmp(k.tag, "provider"))) exported++; }
+            o.line(strf("%s (%zu, exported %zu):", k.title, v.size(), exported));
+            for (auto* c : v) component(o, c, k.tag);
+        }
+    }
+
+    void meta_section(Out& o) {
+        const XNode* m = root(); const XNode* a = app();
+        if (a) {
+            auto md = a->children("meta-data");
+            o.sec(strf("APPLICATION META-DATA (%zu)", md.size()));
+            for (auto* x : md) o.line(pad(val(x, "name", false), 56) + (A(x, "value") ? valr(x, "value") : A(x, "resource") ? "resource " + valr(x, "resource") : std::string()));
+            for (auto* p : a->children("property")) o.line(pad("property " + val(p, "name", false), 56) + (A(p, "value") ? valr(p, "value") : valr(p, "resource")));
+            auto ul = a->children("uses-library"); auto unl = a->children("uses-native-library");
+            auto usl = a->children("uses-static-library"); auto usdk = a->children("uses-sdk-library");
+            if (!ul.empty() || !unl.empty() || !usl.empty() || !usdk.empty()) {
+                o.sec("LIBRARIES (uses-library)");
+                for (auto* x : ul) o.line(pad(val(x, "name"), 56) + (bval(x, "required") == 0 ? "optional" : "required"));
+                for (auto* x : unl) o.line(pad(val(x, "name"), 56) + (bval(x, "required") == 0 ? "optional" : "required") + "  [native]");
+                for (auto* x : usl) o.line(pad(val(x, "name"), 56) + "static  version=" + val(x, "version"));
+                for (auto* x : usdk) o.line(pad(val(x, "name"), 56) + "sdk  versionMajor=" + val(x, "versionMajor"));
+            }
+            if (const XNode* pf = a->child("profileable")) o.kv("<profileable>", attr_list(pf));
+        }
+        auto q = m->children("queries");
+        if (!q.empty()) {
+            o.sec("PACKAGE VISIBILITY (<queries>)");
+            for (auto* qq : q) for (auto& k : qq->kids) {
+                if (k->name == "package") o.line("package   " + val(k.get(), "name"));
+                else if (k->name == "provider") o.line("provider  " + val(k.get(), "authorities"));
+                else if (k->name == "intent") {
+                    std::string s;
+                    for (auto& c : k->kids) s += (s.empty() ? "" : "; ") + (c->name == "data" ? "data " + attr_list(c.get()) : c->name + " " + val(c.get(), "name"));
+                    o.line("intent    " + s);
+                } else o.line(k->name + " " + attr_list(k.get()));
+            }
+        }
+        static const char* handled[] = { "uses-sdk","application","uses-permission","uses-permission-sdk-23","uses-permission-sdk-m","permission","permission-group","permission-tree",
+            "uses-feature","supports-screens","compatible-screens","uses-configuration","supports-gl-texture","queries", nullptr };
+        std::vector<const XNode*> rest;
+        for (auto& k : m->kids) { bool h = false; for (int i = 0; handled[i]; i++) if (k->name == handled[i]) h = true; if (!h && !k->is_text) rest.push_back(k.get()); }
+        if (!rest.empty()) {
+            o.sec("OTHER MANIFEST ELEMENTS");
+            for (auto* r : rest) o.line("<" + r->name + "> " + attr_list(r));
+        }
+    }
+
+    // ------------------------------------------------------------ NATIVE / DEX
+    void native_section(Out& o) {
+        struct Lib { std::string name; const ZipEntry* e; };
+        std::map<std::string, std::vector<Lib>> abis;
+        for (auto& e : z.entries) {
+            if (!starts_with(e.name, L.lib.c_str())) continue;
+            std::string r = e.name.substr(L.lib.size());
+            size_t sl = r.find('/'); if (sl == std::string::npos || sl + 1 >= r.size()) continue;
+            abis[r.substr(0, sl)].push_back({ r.substr(sl + 1), &e });
+        }
+        o.sec(strf("NATIVE LIBRARIES (%zu ABIs)", abis.size()));
+        if (abis.empty()) { o.line("none (pure Java/Kotlin, or native code is in split APKs)"); return; }
+        std::string list; for (auto& a : abis) list += (list.empty() ? "" : ", ") + a.first;
+        o.kv("ABIs", list);
+        size_t checked = 0;
+        for (auto& a : abis) {
+            uint64_t tot = 0; for (auto& l : a.second) tot += l.e->usize;
+            bool is64 = a.first == "arm64-v8a" || a.first == "x86_64" || a.first == "riscv64";
+            o.line(strf("%s: %zu files, %s", a.first.c_str(), a.second.size(), short_size(tot).c_str()));
+            int bad16 = 0, so_count = 0;
+            for (auto& l : a.second) {
+                std::string info;
+                std::string meth = l.e->method == 0 ? "stored" : l.e->method == 8 ? "deflated" : strf("m%u", l.e->method);
+                if (ends_with(lower(l.name), ".so") && checked < 400) {
+                    checked++; so_count++;
+                    std::vector<uint8_t> buf; Bytes v; std::string err;
+                    if (z.read(*l.e, buf, v, 256 * 1024, err)) {
+                        ElfInfo ei = elf_info(v);
+                        if (ei.ok) {
+                            info = strf("ELF%d %s", ei.cls == 2 ? 64 : 32, elf_machine(ei.machine));
+                            if (ei.have_align) {
+                                info += strf("  align %lluK", (unsigned long long)ei.min_align / 1024);
+                                if (is64 && ei.min_align < 16384) { info += " (not 16KB-ready)"; bad16++; }
+                            }
+                            if (ei.api >= 0) info += strf("  NDK api %d", ei.api);
+                            if (!ei.ndk.empty()) info += " " + ei.ndk;
+                        } else info = "not an ELF file";
+                    } else info = "unreadable: " + err;
+                    if (l.e->method == 0) {
+                        uint64_t off = z.data_offset(*l.e);
+                        info += off % 16384 == 0 ? "  zip-aligned 16K" : off % 4096 == 0 ? "  zip-aligned 4K" : "  zip-unaligned";
+                    }
+                }
+                o.line(pad(l.name, 34) + lpad(short_size(l.e->usize), 11) + "  " + pad(meth, 9) + info, 4);
+            }
+            if (is64 && so_count) o.kv("16 KB page size", bad16 ? strf("NOT ready: %d of %d libraries have LOAD alignment < 16 KB", bad16, so_count) : std::string("ready (all LOAD segments >= 16 KB aligned)"), 4);
+        }
+    }
+
+    void dex_section(Out& o) {
+        struct D { int num; const ZipEntry* e; };
+        std::vector<D> dex;
+        for (auto& e : z.entries) {
+            if (!starts_with(e.name, L.dex.c_str())) continue;
+            std::string r = e.name.substr(L.dex.size());
+            if (!starts_with(r, "classes") || !ends_with(r, ".dex") || r.find('/') != std::string::npos) continue;
+            std::string mid = r.substr(7, r.size() - 11);
+            int n = mid.empty() ? 1 : atoi(mid.c_str());
+            if (!mid.empty() && n <= 0) continue;
+            dex.push_back({ n, &e });
+        }
+        std::sort(dex.begin(), dex.end(), [](const D& a, const D& b) { return a.num < b.num; });
+        o.sec(strf("DEX (%zu files)", dex.size()));
+        if (dex.empty()) { o.line("no classes*.dex"); return; }
+        uint64_t tc = 0, tm = 0, tf = 0, ts = 0, tsz = 0, scanned = 0;
+        std::set<std::string> markers;
+        o.line(pad("File", 18) + lpad("Size", 11) + "  Ver  " + lpad("Classes", 8) + lpad("Methods", 9) + lpad("Fields", 9) + lpad("Strings", 9) + lpad("Types", 8));
+        for (auto& d : dex) {
+            std::vector<uint8_t> buf; Bytes v; std::string err;
+            bool full = scanned < (160u << 20);
+            size_t limit = full ? (size_t)(256u << 20) : 0x70;
+            std::string name = basename_of(d.e->name);
+            if (!z.read(*d.e, buf, v, limit, err)) { o.line(pad(name, 18) + "error: " + err); continue; }
+            if (v.n < 0x70 || memcmp(v.p, "dex\n", 4) != 0) { o.line(pad(name, 18) + "not a DEX file"); continue; }
+            std::string ver = sanitize_utf8(std::string((const char*)v.p + 4, 3));
+            uint32_t strs = rd32(v.p + 56), types = rd32(v.p + 64), fields = rd32(v.p + 80), methods = rd32(v.p + 88), classes = rd32(v.p + 96);
+            tc += classes; tm += methods; tf += fields; ts += strs; tsz += d.e->usize;
+            o.line(pad(name, 18) + lpad(short_size(d.e->usize), 11) + "  " + ver + "  " + lpad(with_commas(classes), 8) + lpad(with_commas(methods), 9) + lpad(with_commas(fields), 9) + lpad(with_commas(strs), 9) + lpad(with_commas(types), 8));
+            if (full && v.n > 0x70) {
+                scanned += v.n;
+                for (const char* mk : { "~~R8{", "~~D8{", "~~L8{" }) {
+                    const uint8_t* p = memfind(v.p, v.n, mk, 5);
+                    if (p) { const uint8_t* e = (const uint8_t*)memchr(p, '}', v.n - (p - v.p)); if (e && e - p < 400) markers.insert(sanitize_utf8(std::string((const char*)p, e - p + 1))); }
+                }
+                for (auto& t : kTech) if (t.kind == 'd' && !dex_hits.count(t.pat) && memfind(v.p, v.n, t.pat, strlen(t.pat))) dex_hits.insert(t.pat);
+            }
+        }
+        o.kv("Total", strf("%s classes, %s methods, %s fields, %s strings, %s", with_commas(tc).c_str(), with_commas(tm).c_str(), with_commas(tf).c_str(), with_commas(ts).c_str(), short_size(tsz).c_str()));
+        o.kv("Multidex", dex.size() > 1 ? "yes" : "no");
+        for (auto& m : markers) o.kv("Compiler marker", m);
+        if (markers.empty() && scanned) o.kv("Compiler marker", "none found (dx / old D8, or marker stripped)");
+        if (scanned < tsz) o.line("(library/marker scan covered the first " + short_size(scanned) + " of DEX code)");
+        std::vector<std::string> extra;
+        for (auto& e : z.entries) {
+            std::string n = lower(e.name);
+            if ((ends_with(n, ".dex") && n.find("classes") == std::string::npos) || ends_with(n, ".jar") || ends_with(n, ".odex") || ends_with(n, ".vdex") || ends_with(n, ".oat"))
+                if (extra.size() < 30) extra.push_back(e.name + "  " + short_size(e.usize));
+        }
+        if (!extra.empty()) { o.line("Other code files (dynamic loading / packer?):"); for (auto& x : extra) o.line(x, 4); }
+    }
+
+    void tech_section(Out& o) {
+        std::map<std::string, std::vector<std::string>> groups;
+        std::map<std::string, std::string> evidence;
+        for (auto& t : kTech) {
+            bool hit = false; std::string ev;
+            if (t.kind == 'd') { hit = dex_hits.count(t.pat) > 0; ev = std::string("DEX: ") + t.pat; }
+            else {
+                std::string pat = lower(t.pat);
+                for (auto& n : norm_names) {
+                    bool m = t.kind == 's' ? ends_with(n, pat.c_str()) : t.kind == 'p' ? starts_with(n, pat.c_str()) : n.find(pat) != std::string::npos;
+                    if (m) { hit = true; ev = n; break; }
+                }
+            }
+            if (!hit) continue;
+            auto& g = groups[t.group];
+            if (std::find(g.begin(), g.end(), t.name) == g.end()) { g.push_back(t.name); evidence[t.name] = ev; }
+        }
+        o.sec("FRAMEWORKS & TECHNOLOGIES (heuristic)");
+        if (groups.empty()) o.line("nothing specific detected (plain Android/Java)");
+        for (const char* gname : { "Framework", "Language", "Jetpack", "Google", "Library", "SDK", "Protector" }) {
+            auto it = groups.find(gname); if (it == groups.end()) continue;
+            for (auto& n : it->second) o.line(pad(std::string(gname) + ":", 12) + pad(n, 34) + "<- " + evidence[n]);
+        }
+        auto fw = groups.find("Framework");
+        if (fw != groups.end() && std::find(fw->second.begin(), fw->second.end(), "Flutter") != fw->second.end()) {
+            bool aot = false, jit = false;
+            for (auto& n : norm_names) { if (ends_with(n, "/libapp.so")) aot = true; if (n.find("kernel_blob.bin") != std::string::npos) jit = true; }
+            o.kv("Flutter build", aot ? "release/profile (Dart AOT libapp.so)" : jit ? "debug (JIT kernel_blob.bin)" : "unknown");
+        }
+    }
+
+    void build_section(Out& o) {
+        std::vector<std::pair<std::string, std::string>> libs, props, info;
+        std::string mi = L.root + "META-INF/";
+        size_t kmods = 0;
+        for (auto& e : z.entries) {
+            if (starts_with(e.name, mi.c_str())) {
+                std::string r = e.name.substr(mi.size());
+                if (ends_with(r, ".kotlin_module")) { kmods++; continue; }
+                if (ends_with(r, ".version") && r.find('/') == std::string::npos && e.usize < 256) {
+                    std::vector<uint8_t> b; if (z.read_small(e.name, b, 256)) libs.push_back({ r.substr(0, r.size() - 8), trim(sanitize_utf8(std::string(b.begin(), b.end()))) });
+                } else if (r == "com/android/build/gradle/app-metadata.properties" || r == "version-control-info.textproto" || r == "kotlin-tooling-metadata.json") {
+                    std::vector<uint8_t> b;
+                    if (z.read_small(e.name, b, 64 * 1024)) {
+                        std::string s = sanitize_utf8(std::string(b.begin(), b.end()));
+                        if (r == "kotlin-tooling-metadata.json") {
+                            std::string err; auto j = json_parse(s, err);
+                            if (j) { std::vector<std::pair<std::string, std::string>> fl; json_flatten(*j, "", fl, 60);
+                                for (auto& p : fl) if (lower(p.first).find("version") != std::string::npos || p.first == "buildSystem") info.push_back({ "kotlin " + p.first, p.second }); }
+                        } else if (r == "version-control-info.textproto") {
+                            std::string v;
+                            for (auto& l : split_lines(s)) { l = trim(l); if (l.find(':') != std::string::npos) v += (v.empty() ? "" : "; ") + l; }
+                            info.push_back({ "VCS info", v });
+                        } else for (auto& l : split_lines(s)) { l = trim(l); if (!l.empty() && l[0] != '#') info.push_back({ "app-metadata", l }); }
+                    }
+                }
+            } else if (starts_with(e.name, L.root.c_str())) {
+                std::string r = e.name.substr(L.root.size());
+                if (r.find('/') == std::string::npos && ends_with(r, ".properties") && e.usize < 4096) {
+                    std::vector<uint8_t> b;
+                    if (z.read_small(e.name, b, 4096)) {
+                        std::string ver;
+                        for (auto& l : split_lines(std::string(b.begin(), b.end()))) if (starts_with(l, "version=")) ver = trim(l.substr(8));
+                        props.push_back({ r.substr(0, r.size() - 11), ver.empty() ? "?" : sanitize_utf8(ver) });
+                    }
+                }
+            }
+        }
+        o.sec("BUILD INFO & BUNDLED LIBRARY VERSIONS");
+        for (auto& p : info) o.kv(p.first, p.second);
+        if (kmods) o.kv("Kotlin modules", strf("%zu *.kotlin_module files", kmods));
+        if (info.empty() && libs.empty() && props.empty() && !kmods) { o.line("no build metadata files found"); return; }
+        if (!libs.empty()) {
+            o.line(strf("META-INF/*.version (%zu):", libs.size()));
+            std::sort(libs.begin(), libs.end());
+            for (auto& l : libs) o.line(pad(l.first, 56) + l.second, 4);
+        }
+        if (!props.empty()) {
+            o.line(strf("Root *.properties (Play services / Firebase) (%zu):", props.size()));
+            std::sort(props.begin(), props.end());
+            for (auto& l : props) o.line(pad(l.first, 56) + l.second, 4);
+        }
+    }
+
+    void res_section(Out& o) {
+        o.sec("RESOURCES");
+        if (!res) o.kv("Resource table", res_err.empty() ? std::string("not present") : "error: " + res_err);
+        else {
+            o.kv("Resource table", res->kind);
+            for (auto& p : res->packages) o.kv("Package", strf("0x%02x %s", p.id, p.name.c_str()));
+            if (res->string_pool_size) o.kv("Global string pool", with_commas(res->string_pool_size) + " strings");
+            o.kv("Configurations", with_commas(res->config_count) + " (" + with_commas(res->total_values) + " values)");
+            std::string t;
+            for (auto& kv : res->type_entries) t += (t.empty() ? "" : ", ") + kv.first + strf(" %zu", kv.second);
+            o.kv("Types (entries)", t);
+            std::string loc; for (auto& l : res->locales) loc += (loc.empty() ? "" : " ") + l;
+            o.kv("Locales", strf("%zu", res->locales.size()) + (loc.empty() ? "" : ": " + loc));
+            std::string den; for (auto d : res->densities) den += (den.empty() ? "" : " ") + density_name(d);
+            o.kv("Densities", den.empty() ? "-" : den);
+        }
+        std::map<std::string, size_t> dirs; size_t assets = 0, tot = 0; uint64_t asz = 0;
+        for (auto& e : z.entries) {
+            if (starts_with(e.name, L.res.c_str())) {
+                std::string r = e.name.substr(L.res.size()); size_t sl = r.find('/');
+                std::string d = sl == std::string::npos ? "(root)" : r.substr(0, sl);
+                dirs[d.substr(0, d.find('-'))]++; tot++;
+            } else if (starts_with(e.name, L.assets.c_str())) { assets++; asz += e.usize; }
+        }
+        if (!dirs.empty()) {
+            std::string s; for (auto& d : dirs) s += (s.empty() ? "" : ", ") + d.first + strf(" %zu", d.second);
+            o.kv("res/ files", strf("%zu: ", tot) + s);
+        }
+        o.kv("assets/", strf("%zu files, ", assets) + short_size(asz));
+        o.kv("Manifest XML", L.proto ? std::string("protobuf (aapt2)") : strf("binary, %d strings%s, resource map %d ids", doc.string_count, doc.utf8_pool ? " UTF-8" : " UTF-16", doc.res_map_count));
+    }
+};
+
+// ---------------------------------------------------------------- helpers outside the APK analyzer
+std::string files_list(const Zip& z, const std::string& title) {
+    std::string o = title + strf("  (%zu entries)\n", z.entries.size());
+    o += pad("Method", 9) + lpad("Compressed", 13) + lpad("Size", 13) + lpad("Ratio", 7) + "  CRC32     Modified             " + lpad("Offset", 11) + "  Name\n";
+    for (auto& e : z.entries) {
+        std::string m = e.method == 0 ? "Stored" : e.method == 8 ? "Deflate" : strf("m%u", e.method);
+        if (e.flags & 1) m += "*";
+        std::string ratio = e.usize ? strf("%d%%", (int)(100.0 - 100.0 * (double)e.csize / (double)e.usize)) : "-";
+        o += pad(m, 9) + lpad(with_commas(e.csize), 13) + lpad(with_commas(e.usize), 13) + lpad(ratio, 7) + "  " + strf("%08x", e.crc) + "  " +
+             dos_datetime(e.mdate, e.mtime) + "  " + lpad(strf("%llu", (unsigned long long)e.lho), 11) + "  " + sanitize_utf8(e.name) + "\n";
+    }
+    return o;
+}
+
+void zip_section(Out& o, const Zip& z, const std::string& title, bool container = false) {
+    o.sec(title);
+    std::map<uint16_t, size_t> meth; uint64_t cs = 0, us = 0; size_t enc = 0, dd = 0, dirs = 0, stored = 0, misaligned = 0, utf8 = 0;
+    std::string mn = "9999", mx = "0000";
+    for (auto& e : z.entries) {
+        meth[e.method]++; cs += e.csize; us += e.usize;
+        if (e.flags & 1) enc++;
+        if (e.flags & 8) dd++;
+        if (e.flags & 0x800) utf8++;
+        if (!e.name.empty() && e.name.back() == '/') dirs++;
+        if (e.method == 0 && e.usize) { stored++; if (z.data_offset(e) % 4) misaligned++; }
+        std::string d = dos_datetime(e.mdate, e.mtime); if (d < mn) mn = d; if (d > mx) mx = d;
+    }
+    o.kv("Entries", strf("%zu (%zu directories)", z.entries.size(), dirs));
+    std::string m; for (auto& kv : meth) m += (m.empty() ? "" : ", ") + (kv.first == 0 ? std::string("stored") : kv.first == 8 ? std::string("deflated") : strf("method%u", kv.first)) + strf(" %zu", kv.second);
+    o.kv("Compression methods", m);
+    o.kv("Compressed total", human_size(cs));
+    o.kv("Uncompressed total", human_size(us) + (us ? strf("  (ratio %.1f%%)", 100.0 * (double)cs / (double)us) : ""));
+    o.kv("ZIP64", z.zip64 ? "yes" : "no");
+    o.kv("Central directory", strf("offset %llu, %s", (unsigned long long)z.cd_off, short_size(z.cd_size).c_str()));
+    if (!z.comment.empty()) o.kv("Archive comment", sanitize_utf8(z.comment));
+    if (enc) o.kv("Encrypted entries", strf("%zu", enc));
+    if (dd) o.kv("Data descriptors", strf("%zu entries", dd));
+    if (utf8) o.kv("UTF-8 name flag", strf("%zu entries", utf8));
+    if (!z.entries.empty()) o.kv("Timestamps", mn == mx ? mn + (mn.compare(0, 10, "1981-01-01") == 0 ? "  (fixed: reproducible AGP/bundletool build)" : "") : mn + " .. " + mx);
+    if (stored && !container) o.kv("zipalign (4-byte)", misaligned ? strf("%zu of %zu stored entries NOT aligned", misaligned, stored) : strf("all %zu stored entries aligned", stored));
+}
+
+void file_section(Out& o, const std::string& path, Bytes data, const std::string& kind, const AnalyzeOptions& opt) {
+    o.sec("FILE");
+    o.kv("Path", path);
+    o.kv("Type", kind);
+    o.kv("Size", human_size(data.n));
+    if (opt.hashes && data.n <= opt.hash_limit) {
+        Md5 m; Sha1 s1; Sha256 s2;
+        const size_t CH = 1 << 20;
+        for (size_t off = 0; off < data.n; off += CH) { size_t k = std::min(CH, data.n - off); m.update(data.p + off, k); s1.update(data.p + off, k); s2.update(data.p + off, k); }
+        uint8_t a[16], b[20], c[32]; m.final(a); s1.final(b); s2.final(c);
+        o.kv("MD5", hexstr(a, 16)); o.kv("SHA-1", hexstr(b, 20)); o.kv("SHA-256", hexstr(c, 32));
+    } else if (opt.hashes) o.kv("Hashes", "skipped (file larger than " + short_size(opt.hash_limit) + ")");
+}
+
+void set_titles(Report& rep, const ApkAnalyzer& a) {
+    rep.title = a.label.empty() ? a.pkg : a.label;
+    std::string sub = a.pkg;
+    if (!a.version_name.empty() || !a.version_code.empty()) sub += "   v" + a.version_name + (a.version_code.empty() ? "" : " (" + a.version_code + ")");
+    if (a.min_sdk > 0) sub += strf("   API %d..%d", a.min_sdk, a.target_sdk);
+    sub += "   " + rep.kind;
+    rep.subtitle = sub;
+}
+
+void run_apk(ApkAnalyzer& a, Out& o, const std::string& path, bool aab) {
+    a.find_icon();
+    a.package_section(o);
+    a.sig_section(o, path, aab);
+    a.perms_section(o);
+    a.features_section(o);
+    a.components_section(o);
+    a.meta_section(o);
+    a.native_section(o);
+    a.dex_section(o);
+    a.tech_section(o);
+    a.build_section(o);
+    a.res_section(o);
+}
+
+std::string split_kind(const std::string& file, const std::string& split, bool have_manifest) {
+    std::string n = lower(split);
+    if (!have_manifest) { // derive from file name: config.xx / split_config.xx / base-xx
+        std::string b = lower(basename_of(file));
+        if (ends_with(b, ".apk")) b = b.substr(0, b.size() - 4);
+        if (starts_with(b, "split_")) b = b.substr(6);
+        if (starts_with(b, "base-")) { b = b.substr(5); if (b == "master" || starts_with(b, "master_")) return "base"; b = "config." + b; }
+        if (b == "base") return "base";
+        n = b;
+    }
+    if (n.empty()) return "base";
+    if (!starts_with(n, "config.")) return "feature";
+    std::string c = n.substr(7);
+    for (const char* abi : { "arm64_v8a", "armeabi_v7a", "armeabi", "x86_64", "x86", "riscv64", "mips", "mips64" }) if (c == abi) return "ABI";
+    for (const char* d : { "ldpi", "mdpi", "tvdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi", "nodpi", "anydpi" }) if (c == d) return "density";
+    if (c.size() == 2 || c.size() == 3 || c.find("-r") != std::string::npos || starts_with(c, "b+")) return "language";
+    return "config";
+}
+
+void apex_section(Out& o, const Zip& z) {
+    o.sec("APEX");
+    std::vector<uint8_t> b;
+    if (z.read_small("apex_manifest.pb", b, 1 << 20)) {
+        PbReader r{ Bytes(b) }; PbField f;
+        while (r.next(f)) { if (f.num == 1 && f.wt == 2) o.kv("Name", sanitize_utf8(f.str())); else if (f.num == 2 && f.wt == 0) o.kv("Version", strf("%lld", (long long)f.v)); }
+    }
+    if (z.read_small("apex_manifest.json", b, 1 << 20)) {
+        std::string e2; auto j = json_parse(std::string(b.begin(), b.end()), e2);
+        if (j) { std::vector<std::pair<std::string, std::string>> fl; json_flatten(*j, "", fl); for (auto& p : fl) o.kv(p.first, p.second); }
+    }
+    for (const char* n : { "apex_payload.img", "apex_pubkey", "apex_build_info.pb", "original_apex" }) if (const ZipEntry* e = z.find(n)) o.kv(n, short_size(e->usize));
+}
+
+void aab_section(Out& o, const Zip& z) {
+    o.sec("APP BUNDLE");
+    std::vector<std::string> modules;
+    for (auto& e : z.entries) { size_t k = e.name.find("/manifest/AndroidManifest.xml"); if (k != std::string::npos && e.name.find('/') == k) modules.push_back(e.name.substr(0, k)); }
+    std::string ml; for (auto& m : modules) ml += (ml.empty() ? "" : ", ") + m;
+    o.kv("Modules", strf("%zu: ", modules.size()) + ml);
+    std::vector<uint8_t> b;
+    if (z.read_small("BundleConfig.pb", b, 4 << 20)) {
+        static const char* dim[] = { "unspecified", "ABI", "screen density", "language", "texture compression", "device tier", "country set", "SDK runtime" };
+        PbReader r{ Bytes(b) }; PbField f;
+        while (r.next(f)) {
+            if (f.num == 1 && f.wt == 2) { PbReader q(f.b); PbField g; while (q.next(g)) if (g.num == 2 && g.wt == 2) o.kv("Built by bundletool", sanitize_utf8(g.str())); }
+            else if (f.num == 2 && f.wt == 2) {
+                // Optimizations.splits_config(1).split_dimension(1){value(1), negate(2)}
+                PbReader q(f.b); PbField g; std::string dims;
+                while (q.next(g)) if (g.num == 1 && g.wt == 2) {
+                    PbReader s(g.b); PbField h;
+                    while (s.next(h)) if (h.num == 1 && h.wt == 2) {
+                        PbReader d(h.b); PbField x; uint64_t v = 0; bool neg = false;
+                        while (d.next(x)) { if (x.num == 1 && x.wt == 0) v = x.v; if (x.num == 2 && x.wt == 0) neg = x.v != 0; }
+                        dims += (dims.empty() ? "" : ", ") + std::string(neg ? "no " : "") + (v < 8 ? dim[v] : "?");
+                    }
+                }
+                if (!dims.empty()) o.kv("Split dimensions", dims);
+            }
+        }
+    }
+    size_t meta = 0;
+    for (auto& e : z.entries) if (starts_with(e.name, "BUNDLE-METADATA/") && e.name.back() != '/') { if (meta++ < 20) o.kv("Bundle metadata", e.name.substr(16) + "  " + short_size(e.usize)); }
+    for (const char* n : { "base/assets.pb", "base/native.pb" }) if (z.find(n)) o.kv("Config", n);
+}
+
+} // namespace
+
+void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Report& rep) {
+    auto t0 = std::chrono::steady_clock::now();
+    rep = Report();
+    try {
+        Zip z; std::string err;
+        Out o;
+        if (!z.open(data, err)) {
+            rep.kind = "unknown";
+            file_section(o, path, data, "not a ZIP archive", opt);
+            o.line("ERROR: " + err);
+            rep.error = err; rep.summary = o.s; rep.title = basename_of(path); rep.subtitle = "cannot read: " + err;
+            rep.manifest = rep.files = "(not available)\n";
+            return;
+        }
+        std::string ext = ext_of(path);
+        std::vector<const ZipEntry*> apks;
+        for (auto& e : z.entries) if (ends_with(lower(e.name), ".apk")) apks.push_back(&e);
+        if (z.find("AndroidManifest.xml")) rep.kind = (z.find("apex_manifest.pb") || z.find("apex_manifest.json")) ? "APEX" : "APK";
+        else if (z.find("base/manifest/AndroidManifest.xml")) rep.kind = "AAB";
+        else if (!apks.empty()) rep.kind = ext == "xapk" ? "XAPK" : ext == "apks" ? "APKS" : ext == "apkm" ? "APKM" : z.find("manifest.json") ? "XAPK" : z.find("toc.pb") ? "APKS" : z.find("info.json") ? "APKM" : "APK set";
+        else rep.kind = "ZIP";
+
+        auto pick_base = [&](const std::string& pkgname) -> const ZipEntry* {
+            const ZipEntry* base = nullptr;
+            auto pick = [&](const std::string& n) -> const ZipEntry* { for (auto* e : apks) if (lower(e->name) == lower(n)) return e; return nullptr; };
+            for (const std::string& c : { std::string("base.apk"), pkgname + ".apk", std::string("splits/base-master.apk"), std::string("base-master.apk") }) if (!base) base = pick(c);
+            if (!base) for (auto* e : apks) if (starts_with(e->name, "standalones/")) { base = e; break; }
+            if (!base) for (auto* e : apks) if (lower(basename_of(e->name)).find("config.") == std::string::npos && (!base || e->usize > base->usize)) base = e;
+            if (!base && !apks.empty()) base = apks[0];
+            return base;
+        };
+
+        if (opt.icon_only) {
+            if (rep.kind == "APK" || rep.kind == "APEX") { ApkAnalyzer a(z, apk_layout(), opt, rep); if (a.load()) a.find_icon(); }
+            else if (rep.kind == "AAB") { ApkAnalyzer a(z, aab_layout("base/"), opt, rep); if (a.load()) a.find_icon(); }
+            else if (!apks.empty() && !z.read_small("icon.png", rep.icon, 8u << 20)) {
+                const ZipEntry* base = pick_base("");
+                std::vector<uint8_t> ib; Bytes iv;
+                if (base && z.read(*base, ib, iv, (size_t)1 << 30, err)) { Zip in; if (in.open(iv, err)) { ApkAnalyzer a(in, apk_layout(), opt, rep); if (a.load()) a.find_icon(); } }
+            }
+            rep.ok = !rep.icon.empty();
+            return;
+        }
+
+        file_section(o, path, data, rep.kind, opt);
+        if (rep.kind == "APK" || rep.kind == "APEX" || rep.kind == "AAB") {
+            bool aab = rep.kind == "AAB";
+            if (rep.kind == "APEX") apex_section(o, z);
+            if (aab) aab_section(o, z);
+            ApkAnalyzer a(z, aab ? aab_layout("base/") : apk_layout(), opt, rep);
+            if (a.load()) { run_apk(a, o, path, aab); set_titles(rep, a); rep.manifest = to_xml(a.doc, a.res.get()); }
+            else { o.line("ERROR: " + a.manifest_err); rep.error = a.manifest_err; rep.title = basename_of(path); rep.subtitle = a.manifest_err; }
+            zip_section(o, z, "ZIP STRUCTURE");
+            rep.files = files_list(z, basename_of(path));
+        } else if (!apks.empty()) {
+            o.sec(rep.kind + " CONTAINER");
+            std::string pkgname;
+            for (const char* jn : { "manifest.json", "info.json" }) {
+                std::vector<uint8_t> b;
+                if (!z.read_small(jn, b, 8 << 20)) continue;
+                std::string e2; auto j = json_parse(std::string(b.begin(), b.end()), e2);
+                if (!j) { o.kv(jn, "invalid JSON: " + e2); continue; }
+                o.line(std::string(jn) + ":");
+                std::vector<std::pair<std::string, std::string>> fl; json_flatten(*j, "", fl, 300);
+                for (auto& p : fl) o.kv(p.first, p.second, 4);
+                if (pkgname.empty()) pkgname = j->str("package_name");
+                if (pkgname.empty()) pkgname = j->str("pname");
+            }
+            if (const ZipEntry* t = z.find("toc.pb")) o.kv("toc.pb", short_size(t->usize) + " (bundletool BuildApksResult)");
+            const ZipEntry* base = pick_base(pkgname);
+            o.line(strf("APK files (%zu):", apks.size()));
+            uint64_t tot = 0;
+            for (auto* e : apks) {
+                tot += e->usize;
+                std::string extra, splitname; bool have_m = false;
+                if (e->usize < (64u << 20) || e->method == 0) {
+                    std::vector<uint8_t> sb; Bytes sv; std::string se;
+                    if (z.read(*e, sb, sv, 64u << 20, se)) {
+                        Zip sz;
+                        std::vector<uint8_t> mb; XDoc d;
+                        if (sz.open(sv, se) && sz.read_small("AndroidManifest.xml", mb, 8u << 20) && parse_axml(Bytes(mb), d)) {
+                            const XAttr* sp = d.root->attr("split"); const XAttr* cf = d.root->attr("configForSplit");
+                            have_m = true; if (sp) splitname = sp->str;
+                            extra = sp ? "split=" + sp->str : std::string("(base)");
+                            if (cf && !cf->str.empty()) extra += " configForSplit=" + cf->str;
+                            const XAttr* fs = d.root->attr("isFeatureSplit"); if (fs && fs->data) extra += " feature";
+                        }
+                    }
+                }
+                o.line(pad(e->name, 46) + lpad(short_size(e->usize), 11) + "  " + pad(split_kind(e->name, splitname, have_m), 10) + sanitize_utf8(extra) + (e == base ? "  <= analyzed below" : ""), 4);
+            }
+            o.kv("APK total", short_size(tot));
+            std::vector<std::string> other;
+            for (auto& e : z.entries) {
+                std::string n = lower(e.name);
+                if (!ends_with(n, ".apk") && !n.empty() && n.back() != '/' && other.size() < 40)
+                    other.push_back(sanitize_utf8(e.name) + "  " + short_size(e.usize) + (ends_with(n, ".obb") ? "  (OBB expansion file)" : ""));
+            }
+            if (!other.empty()) { o.line("Other files:"); for (auto& x : other) o.line(x, 4); }
+            zip_section(o, z, "CONTAINER ZIP STRUCTURE", true);
+            rep.files = files_list(z, basename_of(path));
+            std::vector<uint8_t> ib; Bytes iv;
+            if (!z.read(*base, ib, iv, (size_t)1 << 31, err)) { o.line("ERROR reading " + base->name + ": " + err); rep.error = err; }
+            else {
+                Zip in;
+                if (!in.open(iv, err)) { o.line("ERROR: " + base->name + ": " + err); rep.error = err; }
+                else {
+                    o.sec("BASE APK: " + base->name);
+                    o.kv("Size", human_size(iv.n));
+                    if (opt.hashes) o.kv("SHA-256", sha256_hex(iv.p, iv.n));
+                    ApkAnalyzer a(in, apk_layout(), opt, rep);
+                    if (a.load()) { run_apk(a, o, "", false); set_titles(rep, a); rep.manifest = to_xml(a.doc, a.res.get()); }
+                    else { o.line("ERROR: " + a.manifest_err); rep.error = a.manifest_err; }
+                    zip_section(o, in, "BASE APK ZIP STRUCTURE");
+                    rep.files += "\n" + files_list(in, base->name);
+                }
+            }
+            if (rep.icon.empty()) z.read_small("icon.png", rep.icon, 8u << 20);
+            if (rep.title.empty()) { rep.title = basename_of(path); rep.subtitle = rep.kind; }
+        } else {
+            o.line("This ZIP archive contains neither AndroidManifest.xml nor .apk files.");
+            zip_section(o, z, "ZIP STRUCTURE");
+            rep.files = files_list(z, basename_of(path));
+            rep.title = basename_of(path); rep.subtitle = "not an Android package";
+        }
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        o.blank();
+        o.line(strf("APK Lister %s, analysis took %lld ms", apklister_version(), (long long)ms), 0);
+        rep.summary = o.s;
+        if (rep.manifest.empty()) rep.manifest = "(no decodable AndroidManifest.xml)\n";
+        rep.ok = true;
+    } catch (const std::bad_alloc&) {
+        rep.error = "out of memory"; rep.summary += "\nERROR: out of memory while analyzing\n";
+    } catch (...) {
+        rep.error = "internal error"; rep.summary += "\nERROR: internal error while analyzing\n";
+    }
+}

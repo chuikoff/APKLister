@@ -1,0 +1,7 @@
+build/
+bundletool.jar
+*.bmp
+# large real-world samples (download separately, see README)
+samples/com.termux.apk
+samples/de.markusfisch.android.binaryeye.apk
+samples/fdroid.apk

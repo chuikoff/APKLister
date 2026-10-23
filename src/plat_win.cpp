@@ -33,4 +33,3 @@ void MappedFile::close() {
     if (h1) CloseHandle((HANDLE)h1);
     h1 = nullptr;
 }
-bool file_exists_utf8(const std::string& p) { DWORD a = GetFileAttributesW(widen(p).c_str()); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); }

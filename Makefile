@@ -1,6 +1,6 @@
 # APK Lister - Total Commander Lister plugin for Android packages
 # SPDX-License-Identifier: GPL-2.0-or-later
-CORE = util hash inflate zip axml arsc protoxml der apksig json tables analyzer
+CORE = util hash inflate zip axml arsc protoxml json tables analyzer
 CXXFLAGS_COMMON = -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -DUNICODE -D_UNICODE -D__USE_MINGW_ANSI_STDIO=1
 WINLIBS = -lgdi32 -luser32 -lcomctl32 -lole32 -lwindowscodecs -lmsimg32 -luuid -lshlwapi -lcomdlg32
 WINLDFLAGS = -static -static-libgcc -static-libstdc++ -s
@@ -52,7 +52,7 @@ asan: | $(B)
 dist: all
 	rm -rf $(B)/dist && mkdir -p $(B)/dist
 	cp $(B)/apklister.wlx $(B)/apklister.wlx64 pluginst.inf README.md LICENSE $(B)/dist/
-	cd $(B)/dist && rm -f ../apklister-0.1.0.zip && zip -9 -q ../apklister-0.1.0.zip *
+	cd $(B)/dist && rm -f ../apklister-0.1.1.zip && zip -9 -q ../apklister-0.1.1.zip *
 
 clean:
 	rm -rf $(B)

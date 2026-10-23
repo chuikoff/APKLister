@@ -30,24 +30,6 @@ bool Zip::open(Bytes d, std::string& err) {
         }
     }
     if (cd_off > d.n || cd_size > d.n - cd_off) { err = "central directory out of range"; return false; }
-    // APK signing block sits immediately before the central directory
-    if (cd_off >= 24 + 8 && memcmp(d.p + cd_off - 16, "APK Sig Block 42", 16) == 0) {
-        uint64_t sz = rd64(d.p + cd_off - 24);
-        if (sz >= 24 && sz + 8 <= cd_off) {
-            uint64_t start = cd_off - sz - 8;
-            if (rd64(d.p + start) == sz) {
-                has_sig_block = true; sig_block_off = start; sig_block_size = sz + 8;
-                Reader r(d.sub((size_t)start + 8, (size_t)(sz - 24)));
-                while (r.left() >= 12) {
-                    uint64_t len = r.u64();
-                    if (len < 4 || len > r.left()) break;
-                    uint32_t id = r.u32();
-                    Bytes v = r.take((size_t)len - 4);
-                    sig_pairs.push_back({ id, v });
-                }
-            }
-        }
-    }
     Reader r(d.sub((size_t)cd_off, (size_t)cd_size));
     if (total > 2000000) total = 2000000;
     entries.reserve((size_t)total);

@@ -41,7 +41,7 @@ struct Reader {
 
 std::string strf(const char* fmt, ...)
 #if defined(__GNUC__)
-    __attribute__((format(printf, 1, 2)))
+    __attribute__((format(gnu_printf, 1, 2)))
 #endif
     ;
 std::string utf16le_to_utf8(const uint8_t* s, size_t nchars);

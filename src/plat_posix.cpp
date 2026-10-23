@@ -17,4 +17,3 @@ bool MappedFile::open(const std::string& path, std::string& err) {
     return true;
 }
 void MappedFile::close() { if (h1) munmap(h1, size); h1 = nullptr; if (fd >= 0) ::close(fd); fd = -1; p = nullptr; }
-bool file_exists_utf8(const std::string& p) { struct stat st; return stat(p.c_str(), &st) == 0; }

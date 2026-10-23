@@ -28,7 +28,6 @@ static int run(int argc, char** argv) {
     MappedFile mf; std::string err;
     if (!mf.open(file, err)) { fprintf(stderr, "%s: %s\n", file, err.c_str()); return 1; }
     AnalyzeOptions opt; opt.hashes = !nohash;
-    opt.file_exists = [](const std::string& p) { return file_exists_utf8(p); };
     Report r;
     if (icon_out && !strcmp(tab, "summary") && nohash) opt.icon_only = false;
     analyze(file, Bytes(mf.p, (size_t)mf.size), opt, r);

@@ -9,4 +9,3 @@ struct MappedFile {
     void close();
     ~MappedFile() { close(); }
 };
-bool file_exists_utf8(const std::string& p);

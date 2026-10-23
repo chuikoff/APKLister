@@ -4,7 +4,7 @@
 #include "zip.h"
 #include "xml.h"
 #include "arsc.h"
-#include "apksig.h"
+#include "version.h"
 #include "hash.h"
 #include "json.h"
 #include "proto.h"
@@ -15,7 +15,7 @@
 #include <memory>
 #include <set>
 
-const char* apklister_version() { return "0.1.0"; }
+const char* apklister_version() { return APKL_VER_STR; }
 
 namespace {
 
@@ -102,6 +102,54 @@ const char* elf_machine(int m) {
     switch (m) { case 40: return "ARM"; case 183: return "AArch64"; case 3: return "x86"; case 62: return "x86-64"; case 8: return "MIPS"; case 243: return "RISC-V"; default: return "?"; }
 }
 
+// ---- ABIs
+const char* abi_desc(const std::string& a) {
+    if (a == "arm64-v8a") return "64-bit ARM";
+    if (a == "armeabi-v7a") return "32-bit ARM";
+    if (a == "armeabi") return "32-bit ARM, ARMv5/v6, legacy";
+    if (a == "x86_64") return "64-bit x86";
+    if (a == "x86") return "32-bit x86";
+    if (a == "riscv64") return "64-bit RISC-V";
+    if (a == "mips64") return "64-bit MIPS, legacy";
+    if (a == "mips") return "32-bit MIPS, legacy";
+    return nullptr;
+}
+int abi_rank(const std::string& a) {
+    static const char* o[] = { "arm64-v8a", "armeabi-v7a", "armeabi", "x86_64", "x86", "riscv64", "mips64", "mips" };
+    for (int i = 0; i < 8; i++) if (a == o[i]) return i;
+    return 100;
+}
+struct AbiLess { bool operator()(const std::string& a, const std::string& b) const { int x = abi_rank(a), y = abi_rank(b); return x != y ? x < y : a < b; } };
+typedef std::set<std::string, AbiLess> AbiSet;
+// lib/<abi>/<file> (APK) or <module>/lib/<abi>/<file> (AAB)
+void collect_abis(const Zip& z, bool aab, AbiSet& out) {
+    for (auto& e : z.entries) {
+        size_t p = 0;
+        if (aab) { size_t k = e.name.find('/'); if (k == std::string::npos) continue; p = k + 1; }
+        if (e.name.compare(p, 4, "lib/") != 0) continue;
+        size_t s = e.name.find('/', p + 4);
+        if (s == std::string::npos || s == p + 4 || s + 1 >= e.name.size() || s - p - 4 > 32) continue;
+        out.insert(sanitize_utf8(e.name.substr(p + 4, s - p - 4)));
+    }
+}
+// "config.arm64_v8a" -> "arm64-v8a"
+std::string abi_from_split(const std::string& split) {
+    std::string n = lower(split);
+    if (starts_with(n, "split_")) n = n.substr(6);
+    if (!starts_with(n, "config.")) return "";
+    n = n.substr(7);
+    std::replace(n.begin(), n.end(), '_', '-');
+    return abi_desc(n) ? n : "";
+}
+std::string abi_list(const AbiSet& a, bool desc) {
+    std::string s;
+    for (auto& x : a) {
+        s += (s.empty() ? "" : ", ") + x;
+        if (desc) { const char* d = abi_desc(x); if (d) s += std::string(" (") + d + ")"; }
+    }
+    return s;
+}
+
 struct TechRule { const char* group; const char* name; char kind; const char* pat; }; // kind: s=suffix, c=contains, p=prefix, d=dex string
 const TechRule kTech[] = {
     {"Framework","Flutter",'s',"/libflutter.so"},{"Framework","Flutter",'c',"flutter_assets/"},{"Framework","Flutter",'d',"Lio/flutter/embedding/"},
@@ -155,6 +203,7 @@ public:
     std::string pkg, label, version_name, version_code, manifest_err, res_err;
     int min_sdk = -1, target_sdk = -1, max_sdk = -1, compile_sdk = -1;
     std::set<std::string> dex_hits;
+    AbiSet abis; std::string abi_note;
     std::vector<std::string> norm_names; // lower-cased names normalized to APK layout
 
     ApkAnalyzer(const Zip& zz, Layout l, const AnalyzeOptions& o, Report& r) : z(zz), L(l), opt(o), rep(r) {}
@@ -329,6 +378,7 @@ public:
         }
         o.kv("Version name", version_name.empty() ? "-" : (A(m, "versionName") && A(m, "versionName")->type == RT_REFERENCE ? valr(m, "versionName") : version_name));
         o.kv("Version code", version_code.empty() ? "-" : version_code);
+        o.kv("Architecture", abis.empty() ? std::string("universal (no native code)") : abi_list(abis, true) + abi_note);
         o.kv("Min SDK", api_str(min_sdk));
         o.kv("Target SDK", api_str(target_sdk));
         o.kv("Max SDK", max_sdk < 0 ? "-" : api_str(max_sdk));
@@ -387,89 +437,6 @@ public:
             if (!k) other.push_back({ x.name, sanitize_utf8(format_value(x, res.get())) });
         }
         if (!other.empty()) { o.line("Other <manifest> attributes:"); for (auto& p : other) o.kv(p.first, p.second, 4); }
-    }
-
-    // ------------------------------------------------------------ SIGNATURES
-    void cert_lines(Out& o, const CertInfo& c, int ind) {
-        if (!c.ok) { o.line("certificate: " + c.error, ind); return; }
-        o.kv("Subject", c.subject, ind);
-        o.kv("Issuer", c.self_signed ? "(self-signed)" : c.issuer, ind);
-        o.kv("Serial number", "0x" + c.serial_hex + (!c.serial_dec.empty() && c.serial_dec.size() < 40 ? "  (" + c.serial_dec + ")" : ""), ind);
-        o.kv("Valid from", c.not_before, ind);
-        o.kv("Valid until", c.not_after, ind);
-        std::string k = c.key_alg; if (c.key_bits) k += strf(" %d-bit", c.key_bits); if (!c.curve.empty()) k += " " + c.curve;
-        o.kv("Public key", k, ind);
-        o.kv("Signature algorithm", c.sig_alg + strf("  (X.509 v%d, %zu bytes)", c.version, c.der_size), ind);
-        o.kv("SHA-256", c.sha256, ind);
-        o.kv("SHA-1", c.sha1, ind);
-        o.kv("MD5", c.md5, ind);
-        o.kv("Public key SHA-256", c.pubkey_sha256, ind);
-        if (c.subject.find("CN=Android Debug") != std::string::npos) o.line("!! This is the Android DEBUG certificate", ind);
-    }
-
-    void signers(Out& o, const char* scheme, const std::vector<SigSigner>& v) {
-        for (size_t i = 0; i < v.size(); i++) {
-            auto& s = v[i];
-            o.line(strf("%s signer #%zu:", scheme, i + 1));
-            if (s.min_sdk >= 0) o.kv("SDK range", strf("%d .. ", s.min_sdk) + (s.max_sdk == 0x7fffffff ? std::string("any") : strf("%d", s.max_sdk)), 4);
-            std::string al; for (auto x : s.sig_algs) al += (al.empty() ? "" : ", ") + sig_alg_name(x);
-            o.kv("Signature algorithms", al.empty() ? "-" : al, 4);
-            for (auto& at : s.attrs) {
-                const char* n = at.first == 0x3ba06f8c ? "proof-of-rotation (key lineage)" : at.first == 0x559f8b02 ? "rotation-min-sdk-version" :
-                    at.first == 0xc2a6b3ba ? "rotation-on-dev-release" : at.first == 0xbeeff00d ? "stripping protection (v3 present)" : "attribute";
-                o.kv("Attribute", strf("0x%08x %s (%zu bytes)", at.first, n, at.second), 4);
-            }
-            for (size_t k = 0; k < s.certs.size(); k++) { if (s.certs.size() > 1) o.line(strf("certificate %zu:", k + 1), 4); cert_lines(o, s.certs[k], 4); }
-            if (!s.lineage.empty()) {
-                o.line(strf("Key rotation lineage (%zu certificates, oldest first):", s.lineage.size()), 4);
-                for (auto& c : s.lineage) o.line(c.subject + "  SHA-256 " + c.sha256, 6);
-            }
-            if (!s.error.empty()) o.line("error: " + s.error, 4);
-        }
-    }
-
-    void sig_section(Out& o, const std::string& display_path, bool is_aab) {
-        SigInfo si;
-        analyze_signatures(z, is_aab ? std::string() : L.root, si);
-        if (opt.file_exists && !display_path.empty() && opt.file_exists(display_path + ".idsig")) { si.v4 = true; si.idsig_note = display_path + ".idsig"; }
-        o.sec("SIGNATURES");
-        if (is_aab) o.line("(App bundles carry a JAR signature made with the upload key; Play re-signs the generated APKs.)");
-        auto yn = [](bool b) { return b ? std::string("yes") : std::string("no"); };
-        o.kv("v1 (JAR signing)", yn(si.v1));
-        o.kv("v2 (APK Signature Scheme v2)", yn(si.v2));
-        o.kv("v3 (APK Signature Scheme v3)", yn(si.v3));
-        o.kv("v3.1 (rotation targeting)", yn(si.v31));
-        o.kv("v4 (.idsig, incremental)", si.v4 ? "yes: " + basename_of(si.idsig_note) : std::string("no (no .idsig file next to the file)"));
-        o.kv("Source stamp", si.stamp ? std::string("yes") : (si.stamp_file_sha256.empty() ? std::string("no") : std::string("stamp-cert-sha256 file only")));
-        o.line("(signatures are parsed, not cryptographically verified)");
-        if (z.has_sig_block) {
-            o.kv("APK Signing Block", strf("offset %llu, %s", (unsigned long long)z.sig_block_off, short_size(z.sig_block_size).c_str()));
-            for (auto& b : si.blocks) o.line(strf("block 0x%08x  %-38s %s", b.first, sig_block_name(b.first), short_size(b.second).c_str()), 4);
-        }
-        std::set<std::string> fps;
-        for (auto& f : si.v1files) for (auto& c : f.certs) fps.insert(c.sha256);
-        for (auto* v : { &si.v2s, &si.v3s, &si.v31s }) for (auto& s : *v) for (auto& c : s.certs) fps.insert(c.sha256);
-        if (fps.size() > 1) o.kv("Distinct signing certs", strf("%zu (key rotation or multiple signers)", fps.size()));
-        else if (fps.size() == 1) o.kv("Signing certificate", "same certificate in all present schemes");
-        if (si.v1 || !si.v1files.empty() || !si.manifest_headers.empty()) {
-            o.line("v1 / JAR signature:");
-            for (auto& h : si.manifest_headers) o.kv("MANIFEST.MF " + h.first, sanitize_utf8(h.second), 4);
-            if (!si.manifest_headers.empty()) o.kv("MANIFEST.MF entries", strf("%zu", si.manifest_entries), 4);
-            for (auto& f : si.v1files) {
-                o.line(f.name + " (" + f.kind + ")", 4);
-                for (auto& h : f.headers) o.kv(h.first, sanitize_utf8(h.second), 6);
-                if (!f.error.empty()) o.line("error: " + f.error, 6);
-                for (auto& c : f.certs) cert_lines(o, c, 6);
-            }
-        }
-        if (si.v2) signers(o, "v2", si.v2s);
-        if (si.v3) signers(o, "v3", si.v3s);
-        if (si.v31) signers(o, "v3.1", si.v31s);
-        if (si.stamp || !si.stamp_file_sha256.empty()) {
-            o.line("Source stamp:");
-            if (!si.stamp_file_sha256.empty()) o.kv("stamp-cert-sha256", si.stamp_file_sha256, 4);
-            for (auto& c : si.stamp_certs) cert_lines(o, c, 4);
-        }
     }
 
     // ------------------------------------------------------------ PERMISSIONS / FEATURES
@@ -532,95 +499,6 @@ public:
                 o.kv("<" + std::string(t) + ">", s.empty() ? "(no attributes)" : s);
                 for (auto& k : x->kids) o.line("<" + k->name + "> " + attr_list(k.get()), 4);
             }
-        }
-    }
-
-    // ------------------------------------------------------------ COMPONENTS
-    std::string enum_str(const char* nm, uint32_t v, const std::string& raw) const {
-        if (!strcmp(nm, "launchMode")) { static const char* lm[] = { "standard", "singleTop", "singleTask", "singleInstance", "singleInstancePerTask" }; return v < 5 ? lm[v] : raw; }
-        if (!strcmp(nm, "documentLaunchMode")) { static const char* d[] = { "none", "intoExisting", "always", "never" }; return v < 4 ? d[v] : raw; }
-        if (!strcmp(nm, "screenOrientation")) {
-            static const char* so[] = { "landscape","portrait","user","behind","sensor","nosensor","sensorLandscape","sensorPortrait","reverseLandscape","reversePortrait","fullSensor","userLandscape","userPortrait","fullUser","locked" };
-            if (v == 0xFFFFFFFF) return "unspecified";
-            return v < 15 ? so[v] : raw;
-        }
-        if (!strcmp(nm, "foregroundServiceType")) {
-            static const struct { uint32_t f; const char* n; } t[] = { {1,"dataSync"},{2,"mediaPlayback"},{4,"phoneCall"},{8,"location"},{16,"connectedDevice"},{32,"mediaProjection"},
-                {64,"camera"},{128,"microphone"},{256,"health"},{512,"remoteMessaging"},{1024,"systemExempted"},{2048,"shortService"},{4096,"fileManagement"},{8192,"mediaProcessing"},{0x40000000,"specialUse"} };
-            if (v == 0) return "none";
-            std::string s; for (auto& x : t) if (v & x.f) s += (s.empty() ? "" : "|") + std::string(x.n);
-            return s.empty() ? raw : s;
-        }
-        if (!strcmp(nm, "configChanges")) {
-            static const struct { uint32_t f; const char* n; } t[] = { {1,"mcc"},{2,"mnc"},{4,"locale"},{8,"touchscreen"},{16,"keyboard"},{32,"keyboardHidden"},{64,"navigation"},
-                {128,"orientation"},{256,"screenLayout"},{512,"uiMode"},{1024,"screenSize"},{2048,"smallestScreenSize"},{4096,"density"},{8192,"layoutDirection"},
-                {0x4000,"colorMode"},{0x8000,"grammaticalGender"},{0x10000000,"fontWeightAdjustment"},{0x40000000,"fontScale"} };
-            std::string s; for (auto& x : t) if (v & x.f) s += (s.empty() ? "" : "|") + std::string(x.n);
-            return s.empty() ? raw : s;
-        }
-        return raw;
-    }
-
-    void component(Out& o, const XNode* c, const std::string& kind) {
-        bool launcher = false, has_filters = false;
-        for (auto* f : c->children("intent-filter")) {
-            has_filters = true;
-            bool mn = false, lc = false;
-            for (auto* a : f->children("action")) if (val(a, "name") == "android.intent.action.MAIN") mn = true;
-            for (auto* a : f->children("category")) { std::string n = val(a, "name"); if (n == "android.intent.category.LAUNCHER" || n == "android.intent.category.LEANBACK_LAUNCHER") lc = true; }
-            if (mn && lc) launcher = true;
-        }
-        std::string flags;
-        if (launcher) flags += " [LAUNCHER]";
-        int ex = bval(c, "exported");
-        if (ex == 1) flags += " exported";
-        else if (ex == 0) flags += " not-exported";
-        else {
-            bool implicit = kind == "provider" ? target_sdk < 17 : has_filters;
-            if (implicit) flags += (target_sdk >= 31 && kind != "provider") ? " exported(implicit; android:exported MISSING, required for targetSdk>=31)" : " exported(implicit)";
-        }
-        if (bval(c, "enabled") == 0) flags += " disabled";
-        o.line("* " + cls(val(c, "name")) + flags, 4);
-        static const char* show[] = { "targetActivity","permission","process","launchMode","taskAffinity","screenOrientation","authorities","grantUriPermissions",
-            "readPermission","writePermission","foregroundServiceType","isolatedProcess","directBootAware","multiprocess","initOrder","syncable",
-            "excludeFromRecents","noHistory","documentLaunchMode","resizeableActivity","supportsPictureInPicture","showWhenLocked","turnScreenOn",
-            "allowTaskReparenting","alwaysRetainTaskState","stopWithTask","externalService","enableOnBackInvokedCallback","configChanges","windowSoftInputMode", nullptr };
-        std::string attrs;
-        for (int i = 0; show[i]; i++) {
-            const XAttr* x = A(c, show[i]); if (!x) continue;
-            std::string v = format_value(*x, res.get());
-            if (x->type == RT_INT_DEC || x->type == RT_INT_HEX) v = enum_str(show[i], x->data, v);
-            attrs += (attrs.empty() ? "" : "  ") + std::string(show[i]) + "=" + sanitize_utf8(v);
-        }
-        if (!attrs.empty()) o.line(attrs, 8);
-        for (auto* f : c->children("intent-filter")) {
-            std::string h = "intent-filter";
-            if (A(f, "priority")) h += " priority=" + val(f, "priority");
-            if (A(f, "autoVerify")) h += " autoVerify=" + val(f, "autoVerify");
-            if (A(f, "label")) h += " label=" + val(f, "label");
-            o.line(h + ":", 8);
-            for (auto* a : f->children("action")) o.line("action    " + val(a, "name"), 10);
-            for (auto* a : f->children("category")) o.line("category  " + val(a, "name"), 10);
-            for (auto* d : f->children("data")) o.line("data      " + attr_list(d), 10);
-        }
-        for (auto* md : c->children("meta-data")) o.line("meta-data " + val(md, "name", false) + " = " + (A(md, "value") ? valr(md, "value") : A(md, "resource") ? valr(md, "resource") : std::string()), 8);
-        for (auto* pp : c->children("path-permission")) o.line("path-permission  " + attr_list(pp), 8);
-        for (auto* g : c->children("grant-uri-permission")) o.line("grant-uri-permission  " + attr_list(g), 8);
-        for (auto* p : c->children("property")) o.line("property " + val(p, "name", false) + " = " + (A(p, "value") ? valr(p, "value") : valr(p, "resource")), 8);
-    }
-
-    void components_section(Out& o) {
-        const XNode* a = app(); if (!a) return;
-        struct K { const char* tag; const char* title; } kinds[] = { {"activity","Activities"},{"activity-alias","Activity aliases"},{"service","Services"},{"receiver","Broadcast receivers"},{"provider","Content providers"} };
-        size_t total = 0; for (auto& k : kinds) total += a->children(k.tag).size();
-        o.sec(strf("COMPONENTS (%zu)", total));
-        for (auto& k : kinds) {
-            auto v = a->children(k.tag);
-            if (v.empty()) continue;
-            size_t exported = 0;
-            for (auto* c : v) { int e = bval(c, "exported"); if (e == 1 || (e < 0 && !c->children("intent-filter").empty() && strcmp(k.tag, "provider"))) exported++; }
-            o.line(strf("%s (%zu, exported %zu):", k.title, v.size(), exported));
-            for (auto* c : v) component(o, c, k.tag);
         }
     }
 
@@ -944,17 +822,23 @@ void set_titles(Report& rep, const ApkAnalyzer& a) {
     std::string sub = a.pkg;
     if (!a.version_name.empty() || !a.version_code.empty()) sub += "   v" + a.version_name + (a.version_code.empty() ? "" : " (" + a.version_code + ")");
     if (a.min_sdk > 0) sub += strf("   API %d..%d", a.min_sdk, a.target_sdk);
+    sub += "   " + (a.abis.empty() ? std::string("universal") : abi_list(a.abis, false));
     sub += "   " + rep.kind;
     rep.subtitle = sub;
 }
 
-void run_apk(ApkAnalyzer& a, Out& o, const std::string& path, bool aab) {
+void run_apk(ApkAnalyzer& a, Out& o, bool aab, const AbiSet* split_abis = nullptr) {
     a.find_icon();
+    collect_abis(a.z, aab, a.abis);
+    if (split_abis && !split_abis->empty()) {
+        bool extra = false;
+        for (auto& x : *split_abis) if (a.abis.insert(x).second) extra = true;
+        if (extra) a.abi_note = "   (incl. config splits)";
+    }
+    if (aab && !a.abis.empty()) a.abi_note = "   (all modules)";
     a.package_section(o);
-    a.sig_section(o, path, aab);
     a.perms_section(o);
     a.features_section(o);
-    a.components_section(o);
     a.meta_section(o);
     a.native_section(o);
     a.dex_section(o);
@@ -1080,10 +964,10 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
             if (rep.kind == "APEX") apex_section(o, z);
             if (aab) aab_section(o, z);
             ApkAnalyzer a(z, aab ? aab_layout("base/") : apk_layout(), opt, rep);
-            if (a.load()) { run_apk(a, o, path, aab); set_titles(rep, a); rep.manifest = to_xml(a.doc, a.res.get()); }
+            if (a.load()) { run_apk(a, o, aab); set_titles(rep, a); if (!opt.summary_only) rep.manifest = to_xml(a.doc, a.res.get()); }
             else { o.line("ERROR: " + a.manifest_err); rep.error = a.manifest_err; rep.title = basename_of(path); rep.subtitle = a.manifest_err; }
             zip_section(o, z, "ZIP STRUCTURE");
-            rep.files = files_list(z, basename_of(path));
+            if (!opt.summary_only) rep.files = files_list(z, basename_of(path));
         } else if (!apks.empty()) {
             o.sec(rep.kind + " CONTAINER");
             std::string pkgname;
@@ -1101,7 +985,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
             if (const ZipEntry* t = z.find("toc.pb")) o.kv("toc.pb", short_size(t->usize) + " (bundletool BuildApksResult)");
             const ZipEntry* base = pick_base(pkgname);
             o.line(strf("APK files (%zu):", apks.size()));
-            uint64_t tot = 0;
+            uint64_t tot = 0; AbiSet split_abis;
             for (auto* e : apks) {
                 tot += e->usize;
                 std::string extra, splitname; bool have_m = false;
@@ -1110,7 +994,9 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
                     if (z.read(*e, sb, sv, 64u << 20, se)) {
                         Zip sz;
                         std::vector<uint8_t> mb; XDoc d;
-                        if (sz.open(sv, se) && sz.read_small("AndroidManifest.xml", mb, 8u << 20) && parse_axml(Bytes(mb), d)) {
+                        bool zok = sz.open(sv, se);
+                        if (zok && e != base) collect_abis(sz, false, split_abis);
+                        if (zok && sz.read_small("AndroidManifest.xml", mb, 8u << 20) && parse_axml(Bytes(mb), d)) {
                             const XAttr* sp = d.root->attr("split"); const XAttr* cf = d.root->attr("configForSplit");
                             have_m = true; if (sp) splitname = sp->str;
                             extra = sp ? "split=" + sp->str : std::string("(base)");
@@ -1119,6 +1005,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
                         }
                     }
                 }
+                if (e != base) { std::string ab = abi_from_split(have_m ? splitname : basename_of(e->name).substr(0, basename_of(e->name).size() - 4)); if (!ab.empty()) split_abis.insert(ab); }
                 o.line(pad(e->name, 46) + lpad(short_size(e->usize), 11) + "  " + pad(split_kind(e->name, splitname, have_m), 10) + sanitize_utf8(extra) + (e == base ? "  <= analyzed below" : ""), 4);
             }
             o.kv("APK total", short_size(tot));
@@ -1130,7 +1017,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
             }
             if (!other.empty()) { o.line("Other files:"); for (auto& x : other) o.line(x, 4); }
             zip_section(o, z, "CONTAINER ZIP STRUCTURE", true);
-            rep.files = files_list(z, basename_of(path));
+            if (!opt.summary_only) rep.files = files_list(z, basename_of(path));
             std::vector<uint8_t> ib; Bytes iv;
             if (!z.read(*base, ib, iv, (size_t)1 << 31, err)) { o.line("ERROR reading " + base->name + ": " + err); rep.error = err; }
             else {
@@ -1141,10 +1028,10 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
                     o.kv("Size", human_size(iv.n));
                     if (opt.hashes) o.kv("SHA-256", sha256_hex(iv.p, iv.n));
                     ApkAnalyzer a(in, apk_layout(), opt, rep);
-                    if (a.load()) { run_apk(a, o, "", false); set_titles(rep, a); rep.manifest = to_xml(a.doc, a.res.get()); }
+                    if (a.load()) { run_apk(a, o, false, &split_abis); set_titles(rep, a); if (!opt.summary_only) rep.manifest = to_xml(a.doc, a.res.get()); }
                     else { o.line("ERROR: " + a.manifest_err); rep.error = a.manifest_err; }
                     zip_section(o, in, "BASE APK ZIP STRUCTURE");
-                    rep.files += "\n" + files_list(in, base->name);
+                    if (!opt.summary_only) rep.files += "\n" + files_list(in, base->name);
                 }
             }
             if (rep.icon.empty()) z.read_small("icon.png", rep.icon, 8u << 20);
@@ -1152,14 +1039,14 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
         } else {
             o.line("This ZIP archive contains neither AndroidManifest.xml nor .apk files.");
             zip_section(o, z, "ZIP STRUCTURE");
-            rep.files = files_list(z, basename_of(path));
+            if (!opt.summary_only) rep.files = files_list(z, basename_of(path));
             rep.title = basename_of(path); rep.subtitle = "not an Android package";
         }
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         o.blank();
         o.line(strf("APK Lister %s, analysis took %lld ms", apklister_version(), (long long)ms), 0);
         rep.summary = o.s;
-        if (rep.manifest.empty()) rep.manifest = "(no decodable AndroidManifest.xml)\n";
+        if (!opt.summary_only && rep.manifest.empty()) rep.manifest = "(no decodable AndroidManifest.xml)\n";
         rep.ok = true;
     } catch (const std::bad_alloc&) {
         rep.error = "out of memory"; rep.summary += "\nERROR: out of memory while analyzing\n";

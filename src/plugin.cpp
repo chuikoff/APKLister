@@ -25,16 +25,13 @@ struct ListDefaultParamStruct { int size; DWORD PluginInterfaceVersionLow; DWORD
 
 static HINSTANCE g_inst;
 static const wchar_t* kClass = L"APKListerWindow";
-static const wchar_t* kTabNames[3] = { L"Summary", L"AndroidManifest.xml", L"Files" };
 
 struct View {
-    HWND hwnd = nullptr, tab = nullptr, edit = nullptr;
+    HWND hwnd = nullptr, edit = nullptr;
     HFONT mono = nullptr, title_font = nullptr, ui_font = nullptr;
     WNDPROC old_edit = nullptr;
     Report rep;
-    std::wstring text[3], lower_text[3];
-    int first_line[3] = { 0, 0, 0 };
-    int cur = 0;
+    std::wstring text, lower_text;
     HBITMAP icon = nullptr; int icon_w = 0, icon_h = 0;
     std::wstring title, subtitle;
     int dpi = 96;
@@ -96,25 +93,10 @@ static HBITMAP decode_image(const std::vector<uint8_t>& data, int maxw, int maxh
     return bmp;
 }
 
-static void set_tab(View* v, int t) {
-    if (t < 0 || t > 2) return;
-    if (v->edit) v->first_line[v->cur] = (int)SendMessageW(v->edit, EM_GETFIRSTVISIBLELINE, 0, 0);
-    v->cur = t;
-    TabCtrl_SetCurSel(v->tab, t);
-    SendMessageW(v->edit, WM_SETREDRAW, FALSE, 0);
-    SetWindowTextW(v->edit, v->text[t].c_str());
-    SendMessageW(v->edit, EM_SETSEL, 0, 0);
-    if (v->first_line[t]) SendMessageW(v->edit, EM_LINESCROLL, 0, v->first_line[t]);
-    SendMessageW(v->edit, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(v->edit, nullptr, TRUE);
-}
-
 static void layout(View* v) {
     RECT rc; GetClientRect(v->hwnd, &rc);
     int hh = v->S(58);
-    int th = v->S(26);
-    MoveWindow(v->tab, 0, hh, rc.right, th, TRUE);
-    MoveWindow(v->edit, 0, hh + th, rc.right, rc.bottom - hh - th > 0 ? rc.bottom - hh - th : 0, TRUE);
+    MoveWindow(v->edit, 0, hh, rc.right, rc.bottom - hh > 0 ? rc.bottom - hh : 0, TRUE);
     InvalidateRect(v->hwnd, nullptr, FALSE);
 }
 
@@ -127,36 +109,36 @@ static void load_file(View* v, const std::wstring& path) {
         v->rep.summary = "Cannot open " + p8 + ":\n" + err + "\n";
     } else {
         AnalyzeOptions opt;
-        opt.file_exists = [](const std::string& f) { return file_exists_utf8(f); };
+        opt.summary_only = true;
         analyze(p8, Bytes(mf.p, (size_t)mf.size), opt, v->rep);
     }
-    v->text[0] = crlf(v->rep.summary);
-    v->text[1] = crlf(v->rep.manifest);
-    v->text[2] = crlf(v->rep.files);
-    for (int i = 0; i < 3; i++) { v->lower_text[i].clear(); v->first_line[i] = 0; }
+    v->text = crlf(v->rep.summary);
+    v->lower_text.clear();
+    v->rep.summary.clear(); v->rep.summary.shrink_to_fit();
     v->title = widen(v->rep.title); v->subtitle = widen(v->rep.subtitle);
     if (v->icon) DeleteObject(v->icon);
     v->icon = decode_image(v->rep.icon, v->S(44), v->S(44), false, &v->icon_w, &v->icon_h);
     v->rep.icon.clear(); v->rep.icon.shrink_to_fit();
-    v->cur = 0;
-    set_tab(v, 0);
+    SendMessageW(v->edit, WM_SETREDRAW, FALSE, 0);
+    SetWindowTextW(v->edit, v->text.c_str());
+    SendMessageW(v->edit, EM_SETSEL, 0, 0);
+    SendMessageW(v->edit, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(v->edit, nullptr, TRUE);
     InvalidateRect(v->hwnd, nullptr, TRUE);
 }
 
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     View* v = (View*)GetWindowLongPtrW(GetParent(h), GWLP_USERDATA);
     if (!v) return DefWindowProcW(h, m, w, l);
-    bool ctrl = GetKeyState(VK_CONTROL) < 0, alt = GetKeyState(VK_MENU) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    bool ctrl = GetKeyState(VK_CONTROL) < 0;
     if (m == WM_KEYDOWN) {
-        if (!ctrl && !alt && (w == '1' || w == '2' || w == '3')) { set_tab(v, (int)(w - '1')); return 0; }
-        if (ctrl && w == VK_TAB) { set_tab(v, (v->cur + (shift ? 2 : 1)) % 3); return 0; }
         if (ctrl && w == 'A') { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
         if (ctrl && (w == 'C' || w == VK_INSERT)) { SendMessageW(h, WM_COPY, 0, 0); return 0; }
         switch (w) {
         case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_PRIOR: case VK_NEXT: case VK_HOME: case VK_END:
         case VK_SHIFT: case VK_CONTROL: case VK_MENU:
             break;
-        default: // let Total Commander's lister handle everything else (Esc, N/P, F-keys, 4-7, ...)
+        default: // let Total Commander's lister handle everything else (Esc, N/P, F-keys, 1-7 view modes, ...)
             PostMessageW(GetParent(v->hwnd), m, w, l);
             return 0;
         }
@@ -179,12 +161,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         v->mono = CreateFontW(-MulDiv(10, v->dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
         v->title_font = CreateFontW(-MulDiv(14, v->dpi, 72), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
         v->ui_font = CreateFontW(-MulDiv(9, v->dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
-        v->tab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FOCUSNEVER, 0, 0, 10, 10, h, (HMENU)1, g_inst, nullptr);
-        SendMessageW(v->tab, WM_SETFONT, (WPARAM)v->ui_font, TRUE);
-        for (int i = 0; i < 3; i++) {
-            wchar_t buf[64]; wsprintfW(buf, L"%d  %s", i + 1, kTabNames[i]);
-            TCITEMW it = {}; it.mask = TCIF_TEXT; it.pszText = buf; TabCtrl_InsertItem(v->tab, i, &it);
-        }
         v->edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
             0, 0, 10, 10, h, (HMENU)2, g_inst, nullptr);
         SendMessageW(v->edit, WM_SETFONT, (WPARAM)v->mono, TRUE);
@@ -195,11 +171,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_SIZE: if (v) layout(v); return 0;
     case WM_SETFOCUS: if (v) SetFocus(v->edit); return 0;
-    case WM_NOTIFY: {
-        NMHDR* nh = (NMHDR*)l;
-        if (v && nh->hwndFrom == v->tab && nh->code == TCN_SELCHANGE) { set_tab(v, TabCtrl_GetCurSel(v->tab)); SetFocus(v->edit); }
-        return 0;
-    }
     case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w; SetTextColor(dc, RGB(0x1f, 0x23, 0x28)); SetBkColor(dc, RGB(255, 255, 255));
         return (LRESULT)GetStockObject(WHITE_BRUSH);
@@ -257,7 +228,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 static bool register_class() {
     static bool done = false;
     if (done) return true;
-    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_TAB_CLASSES }; InitCommonControlsEx(&icc);
+    INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_STANDARD_CLASSES }; InitCommonControlsEx(&icc);
     WNDCLASSW wc = {}; wc.lpfnWndProc = WndProc; wc.hInstance = g_inst; wc.lpszClassName = kClass;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.style = CS_HREDRAW | CS_VREDRAW;
     done = RegisterClassW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
@@ -323,11 +294,11 @@ EXPORT int __stdcall ListSearchTextW(HWND win, WCHAR* what, int params) {
     View* v = (View*)GetWindowLongPtrW(win, GWLP_USERDATA);
     if (!v || !what || !*what) return LISTPLUGIN_ERROR;
     bool mc = params & lcs_matchcase, ww = params & lcs_wholewords, back = params & lcs_backwards;
-    const std::wstring& txt = v->text[v->cur];
+    const std::wstring& txt = v->text;
     std::wstring needle = what;
     const std::wstring* hay = &txt;
     if (!mc) {
-        std::wstring& lt = v->lower_text[v->cur];
+        std::wstring& lt = v->lower_text;
         if (lt.size() != txt.size()) { lt = txt; if (!lt.empty()) CharLowerBuffW(&lt[0], (DWORD)lt.size()); }
         CharLowerBuffW(&needle[0], (DWORD)needle.size());
         hay = &lt;

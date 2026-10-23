@@ -1,5 +1,5 @@
 // Minimal Lister host for testing apklister.wlx/.wlx64 without Total Commander.
-// usage: testhost.exe plugin.wlx64 file [search-text] [--preview out.bmp]
+// usage: testhost.exe plugin.wlx64 file [search-text] [--preview out.bmp] [--size WxH]
 #include <windows.h>
 #include <cstdio>
 #include <string>
@@ -25,7 +25,7 @@ static void save_bmp(HBITMAP b, const wchar_t* path) {
     fwrite(&fh, sizeof fh, 1, f); fwrite(&bi, sizeof bi, 1, f); fwrite(px.data(), px.size(), 1, f); fclose(f);
 }
 int wmain(int argc, wchar_t** argv) {
-    if (argc < 3) { MessageBoxW(nullptr, L"usage: testhost plugin.wlx64 file [search] [--preview out.bmp]", L"testhost", 0); return 2; }
+    if (argc < 3) { MessageBoxW(nullptr, L"usage: testhost plugin.wlx64 file [search] [--preview out.bmp] [--size WxH]", L"testhost", 0); return 2; }
     HMODULE dll = LoadLibraryW(argv[1]);
     if (!dll) { fwprintf(stderr, L"cannot load %ls (%lu)\n", argv[1], GetLastError()); return 1; }
     PLoad load = (PLoad)(void*)GetProcAddress(dll, "ListLoadW");
@@ -35,9 +35,11 @@ int wmain(int argc, wchar_t** argv) {
     PClose close = (PClose)(void*)GetProcAddress(dll, "ListCloseWindow");
     char ds[512] = ""; if (detect) detect(ds, sizeof ds);
     fprintf(stderr, "exports: ListLoadW=%p ListSearchTextW=%p ListGetPreviewBitmapW=%p ListCloseWindow=%p\ndetect: %s\n", (void*)load, (void*)search, (void*)preview, (void*)close, ds);
+    int ww = 1180, wh = 860;
     const wchar_t* find = nullptr; const wchar_t* prev = nullptr;
     for (int i = 3; i < argc; i++) {
         if (!wcscmp(argv[i], L"--preview") && i + 1 < argc) prev = argv[++i];
+        else if (!wcscmp(argv[i], L"--size") && i + 1 < argc) { swscanf(argv[++i], L"%dx%d", &ww, &wh); }
         else find = argv[i];
     }
     if (prev && preview) {
@@ -50,7 +52,7 @@ int wmain(int argc, wchar_t** argv) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
     std::wstring t = L"Lister - [" + std::wstring(argv[2]) + L"]";
-    HWND main = CreateWindowExW(0, L"TestLister", t.c_str(), WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 1180, 860, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND main = CreateWindowExW(0, L"TestLister", t.c_str(), WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, ww, wh, nullptr, nullptr, wc.hInstance, nullptr);
     DWORD t0 = GetTickCount();
     g_plugin = load ? load(main, argv[2], 0) : nullptr;
     fprintf(stderr, "ListLoadW -> %p in %lu ms\n", (void*)g_plugin, GetTickCount() - t0);

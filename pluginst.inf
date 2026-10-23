@@ -1,5 +1,6 @@
 [plugininstall]
-description=APK Lister - technical info viewer for Android packages (APK, XAPK, APKS, APKM, AAB, APEX)
+description=APK Lister 0.1.2 - technical info viewer for Android packages (APK, XAPK, APKS, APKM, AAB, APEX)
 type=wlx
 file=apklister.wlx
 defaultdir=apklister
+version=0.1.2

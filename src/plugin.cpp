@@ -7,6 +7,7 @@
 #include <vector>
 #include "analyzer.h"
 #include "plat.h"
+#include "version.h"
 
 #define EXPORT extern "C" __declspec(dllexport)
 
@@ -24,16 +25,18 @@
 struct ListDefaultParamStruct { int size; DWORD PluginInterfaceVersionLow; DWORD PluginInterfaceVersionHi; char DefaultIniName[MAX_PATH]; };
 
 static HINSTANCE g_inst;
+static wchar_t g_default_ini[MAX_PATH]; // TC's lsplugin.ini (from ListSetDefaultParams)
 static const wchar_t* kClass = L"APKListerWindow";
+static const int kHeaderH = 76; // header height at 96 dpi: title, package line, architecture line
 
 struct View {
     HWND hwnd = nullptr, edit = nullptr;
-    HFONT mono = nullptr, title_font = nullptr, ui_font = nullptr;
+    HFONT mono = nullptr, title_font = nullptr, ui_font = nullptr, ui_bold = nullptr;
     WNDPROC old_edit = nullptr;
     Report rep;
     std::wstring text, lower_text;
     HBITMAP icon = nullptr; int icon_w = 0, icon_h = 0;
-    std::wstring title, subtitle;
+    std::wstring title, subtitle, arch;
     int dpi = 96;
     int S(int v) const { return MulDiv(v, dpi, 96); }
 };
@@ -52,6 +55,33 @@ static std::wstring crlf(const std::string& s) {
     std::wstring w = widen(s), o; o.reserve(w.size() + w.size() / 20);
     for (wchar_t c : w) { if (c == L'\n') o += L'\r'; o += c; }
     return o;
+}
+
+// ---- language: apklister.ini next to the plugin, then TC's lsplugin.ini ([APKLister] Language=auto|ru|en),
+// then TC's own UI language (wincmd.ini [Configuration] LanguageIni), then the Windows UI language.
+static std::wstring read_ini(const wchar_t* file, const wchar_t* sec, const wchar_t* key) {
+    if (!file || !*file) return L"";
+    wchar_t buf[260] = L"";
+    GetPrivateProfileStringW(sec, key, L"\x01", buf, 260, file);
+    return buf[0] == 1 ? std::wstring(L"\x01") : std::wstring(buf);
+}
+static bool lang_from_setting(const std::wstring& v, Lang& out) { return v != L"\x01" && parse_lang(narrow(v), out); }
+static Lang resolve_lang() {
+    Lang l;
+    wchar_t dll[MAX_PATH] = L""; GetModuleFileNameW(g_inst, dll, MAX_PATH);
+    std::wstring own = dll; size_t k = own.find_last_of(L"\\/"); own = (k == std::wstring::npos ? std::wstring() : own.substr(0, k + 1)) + L"apklister.ini";
+    if (lang_from_setting(read_ini(own.c_str(), L"APKLister", L"Language"), l)) return l;
+    if (lang_from_setting(read_ini(g_default_ini, L"APKLister", L"Language"), l)) return l;
+    wchar_t tcini[MAX_PATH] = L"";
+    if (GetEnvironmentVariableW(L"COMMANDER_INI", tcini, MAX_PATH) && tcini[0]) {
+        std::wstring li = read_ini(tcini, L"Configuration", L"LanguageIni");
+        if (li != L"\x01") {
+            CharLowerBuffW(&li[0], (DWORD)li.size());
+            if (li.find(L"rus") != std::wstring::npos) return Lang::Ru;
+            if (!li.empty()) return Lang::En;
+        }
+    }
+    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN ? Lang::Ru : Lang::En;
 }
 
 // ---- icon decoding through WIC (PNG always; WebP/JPEG when the codec exists)
@@ -95,7 +125,7 @@ static HBITMAP decode_image(const std::vector<uint8_t>& data, int maxw, int maxh
 
 static void layout(View* v) {
     RECT rc; GetClientRect(v->hwnd, &rc);
-    int hh = v->S(58);
+    int hh = v->S(kHeaderH);
     MoveWindow(v->edit, 0, hh, rc.right, rc.bottom - hh > 0 ? rc.bottom - hh : 0, TRUE);
     InvalidateRect(v->hwnd, nullptr, FALSE);
 }
@@ -103,19 +133,22 @@ static void layout(View* v) {
 static void load_file(View* v, const std::wstring& path) {
     v->rep = Report();
     MappedFile mf; std::string err; std::string p8 = narrow(path);
+    Lang lang = resolve_lang();
+    set_lang(lang);
     if (!mf.open(p8, err)) {
         v->rep.title = narrow(path.substr(path.find_last_of(L"\\/") + 1));
-        v->rep.subtitle = "cannot open file: " + err;
-        v->rep.summary = "Cannot open " + p8 + ":\n" + err + "\n";
+        v->rep.subtitle = T("cannot open file: ") + err;
+        v->rep.summary = T("cannot open file: ") + p8 + "\n" + err + "\n";
     } else {
         AnalyzeOptions opt;
         opt.summary_only = true;
+        opt.lang = lang;
         analyze(p8, Bytes(mf.p, (size_t)mf.size), opt, v->rep);
     }
     v->text = crlf(v->rep.summary);
     v->lower_text.clear();
     v->rep.summary.clear(); v->rep.summary.shrink_to_fit();
-    v->title = widen(v->rep.title); v->subtitle = widen(v->rep.subtitle);
+    v->title = widen(v->rep.title); v->subtitle = widen(v->rep.subtitle); v->arch = widen(v->rep.arch);
     if (v->icon) DeleteObject(v->icon);
     v->icon = decode_image(v->rep.icon, v->S(44), v->S(44), false, &v->icon_w, &v->icon_h);
     v->rep.icon.clear(); v->rep.icon.shrink_to_fit();
@@ -160,6 +193,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HDC dc = GetDC(h); v->dpi = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(h, dc);
         v->mono = CreateFontW(-MulDiv(10, v->dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
         v->title_font = CreateFontW(-MulDiv(14, v->dpi, 72), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
+        v->ui_bold = CreateFontW(-MulDiv(9, v->dpi, 72), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
         v->ui_font = CreateFontW(-MulDiv(9, v->dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, L"Segoe UI");
         v->edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL,
             0, 0, 10, 10, h, (HMENU)2, g_inst, nullptr);
@@ -180,33 +214,44 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         if (v) {
             RECT rc; GetClientRect(h, &rc);
-            RECT hr = { 0, 0, rc.right, v->S(58) };
+            RECT hr = { 0, 0, rc.right, v->S(kHeaderH) };
             HBRUSH bg = CreateSolidBrush(RGB(0xf6, 0xf8, 0xfa)); FillRect(dc, &hr, bg); DeleteObject(bg);
             RECT line = { 0, hr.bottom - 1, rc.right, hr.bottom }; HBRUSH lb = CreateSolidBrush(RGB(0xd0, 0xd7, 0xde)); FillRect(dc, &line, lb); DeleteObject(lb);
             int x = v->S(10);
             if (v->icon) {
                 HDC mdc = CreateCompatibleDC(dc); HGDIOBJ old = SelectObject(mdc, v->icon);
                 BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-                int box = v->S(44), ix = x + (box - v->icon_w) / 2, iy = v->S(7) + (box - v->icon_h) / 2;
+                int box = v->S(44), ix = x + (box - v->icon_w) / 2, iy = v->S(16) + (box - v->icon_h) / 2;
                 AlphaBlend(dc, ix, iy, v->icon_w, v->icon_h, mdc, 0, 0, v->icon_w, v->icon_h, bf);
                 SelectObject(mdc, old); DeleteDC(mdc);
                 x += box + v->S(10);
             } else {
-                RECT ib = { x, v->S(7), x + v->S(44), v->S(51) };
+                RECT ib = { x, v->S(16), x + v->S(44), v->S(60) };
                 HBRUSH g = CreateSolidBrush(RGB(0x3d, 0xdc, 0x84)); FillRect(dc, &ib, g); DeleteObject(g);
                 SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(255, 255, 255)); HGDIOBJ of = SelectObject(dc, v->title_font);
                 DrawTextW(dc, L"APK", 3, &ib, DT_CENTER | DT_VCENTER | DT_SINGLELINE); SelectObject(dc, of);
                 x += v->S(54);
             }
             SetBkMode(dc, TRANSPARENT);
-            HGDIOBJ of = SelectObject(dc, v->title_font);
+            HGDIOBJ of = SelectObject(dc, v->ui_font);
+            // version in the top right corner, so the user can see which DLL TC actually loaded
+            static const wchar_t* ver = L"APK Lister " TEXT(APKL_VER_STR);
+            SIZE vs = {}; GetTextExtentPoint32W(dc, ver, lstrlenW(ver), &vs);
+            SetTextColor(dc, RGB(0x8c, 0x95, 0x9f));
+            RECT vr = { rc.right - v->S(8) - vs.cx, v->S(6), rc.right - v->S(8), v->S(24) };
+            DrawTextW(dc, ver, -1, &vr, DT_SINGLELINE | DT_RIGHT | DT_NOPREFIX);
+            SelectObject(dc, v->title_font);
             SetTextColor(dc, RGB(0x1f, 0x23, 0x28));
-            RECT tr = { x, v->S(6), rc.right - v->S(8), v->S(32) };
+            RECT tr = { x, v->S(4), rc.right - v->S(16) - vs.cx, v->S(30) };
             DrawTextW(dc, v->title.c_str(), (int)v->title.size(), &tr, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             SelectObject(dc, v->ui_font);
             SetTextColor(dc, RGB(0x57, 0x60, 0x6a));
-            RECT sr = { x, v->S(32), rc.right - v->S(8), v->S(54) };
+            RECT sr = { x, v->S(31), rc.right - v->S(8), v->S(50) };
             DrawTextW(dc, v->subtitle.c_str(), (int)v->subtitle.size(), &sr, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(dc, v->ui_bold);
+            SetTextColor(dc, RGB(0x0b, 0x6e, 0x4f));
+            RECT ar = { x, v->S(51), rc.right - v->S(8), v->S(71) };
+            DrawTextW(dc, v->arch.c_str(), (int)v->arch.size(), &ar, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             SelectObject(dc, of);
         }
         EndPaint(h, &ps);
@@ -216,7 +261,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (v) {
             SetWindowLongPtrW(v->edit, GWLP_WNDPROC, (LONG_PTR)v->old_edit);
             if (v->icon) DeleteObject(v->icon);
-            DeleteObject(v->mono); DeleteObject(v->title_font); DeleteObject(v->ui_font);
+            DeleteObject(v->mono); DeleteObject(v->title_font); DeleteObject(v->ui_font); DeleteObject(v->ui_bold);
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
             delete v;
         }
@@ -275,7 +320,9 @@ EXPORT void __stdcall ListGetDetectString(char* s, int maxlen) {
     lstrcpynA(s, "EXT=\"APK\" | EXT=\"XAPK\" | EXT=\"APKS\" | EXT=\"APKM\" | EXT=\"AAB\" | EXT=\"APEX\"", maxlen);
 }
 
-EXPORT void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) { (void)dps; }
+EXPORT void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) {
+    if (dps && dps->DefaultIniName[0]) MultiByteToWideChar(CP_ACP, 0, dps->DefaultIniName, -1, g_default_ini, MAX_PATH);
+}
 
 EXPORT int __stdcall ListSendCommand(HWND win, int cmd, int param) {
     View* v = (View*)GetWindowLongPtrW(win, GWLP_USERDATA);
@@ -335,7 +382,7 @@ EXPORT int __stdcall ListSearchText(HWND win, char* what, int params) {
 EXPORT HBITMAP __stdcall ListGetPreviewBitmapW(WCHAR* file, int width, int height, char* contentbuf, int contentbuflen) {
     MappedFile mf; std::string err;
     if (!mf.open(narrow(file), err)) return nullptr;
-    AnalyzeOptions opt; opt.icon_only = true; opt.hashes = false;
+    AnalyzeOptions opt; opt.icon_only = true;
     Report r;
     analyze(narrow(file), Bytes(mf.p, (size_t)mf.size), opt, r);
     if (r.icon.empty()) return nullptr;

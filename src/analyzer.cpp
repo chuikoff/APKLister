@@ -5,7 +5,7 @@
 #include "xml.h"
 #include "arsc.h"
 #include "version.h"
-#include "hash.h"
+#include "i18n.h"
 #include "json.h"
 #include "proto.h"
 #include "tables.h"
@@ -24,30 +24,32 @@ struct Out {
     std::string s;
     void sec(const std::string& t) {
         if (!s.empty()) s += "\n";
-        std::string h = "== " + t + " "; while (h.size() < 78) h += '=';
+        std::string h = "== " + T(t) + " "; size_t w = u8len(h); while (w++ < 78) h += '=';
         s += h + "\n";
     }
     void kv(const std::string& k, const std::string& v, int ind = 2) {
-        std::string l((size_t)ind, ' '); l += k;
-        if (l.size() < KW) l.append(KW - l.size(), ' '); else l += ' ';
+        std::string l((size_t)ind, ' '); l += T(k);
+        size_t w = u8len(l);
+        if (w < KW) l.append(KW - w, ' '); else l += ' ';
         s += l + v + "\n";
     }
     void line(const std::string& t, int ind = 2) { s += std::string((size_t)ind, ' ') + t + "\n"; }
     void blank() { s += "\n"; }
 };
 
-std::string pad(const std::string& s, size_t w) { return s.size() >= w ? s + " " : s + std::string(w - s.size(), ' '); }
-std::string lpad(const std::string& s, size_t w) { return s.size() >= w ? s : std::string(w - s.size(), ' ') + s; }
+std::string pad(const std::string& s, size_t w) { size_t n = u8len(s); return n >= w ? s + " " : s + std::string(w - n, ' '); }
+std::string lpad(const std::string& s, size_t w) { size_t n = u8len(s); return n >= w ? s : std::string(w - n, ' ') + s; }
 std::string short_size(uint64_t n) {
-    if (n < 1024) return strf("%llu B", (unsigned long long)n);
-    if (n < 1024 * 1024) return strf("%.1f KiB", n / 1024.0);
-    if (n < 1024ull * 1024 * 1024) return strf("%.2f MiB", n / 1048576.0);
-    return strf("%.2f GiB", n / 1073741824.0);
+    bool ru = get_lang() == Lang::Ru;
+    if (n < 1024) return strf("%llu %s", (unsigned long long)n, ru ? "Б" : "B");
+    if (n < 1024 * 1024) return strf("%.1f %s", n / 1024.0, ru ? "КиБ" : "KiB");
+    if (n < 1024ull * 1024 * 1024) return strf("%.2f %s", n / 1048576.0, ru ? "МиБ" : "MiB");
+    return strf("%.2f %s", n / 1073741824.0, ru ? "ГиБ" : "GiB");
 }
 std::string api_str(int api) {
     if (api < 0) return "-";
     const char* n = android_version_name(api);
-    return n ? strf("%d (Android %s)", api, n) : strf("%d", api);
+    return n ? strf("%d (Android %s)", api, T(n)) : strf("%d", api);
 }
 std::string basename_of(const std::string& p) { size_t k = p.find_last_of("/\\"); return k == std::string::npos ? p : p.substr(k + 1); }
 std::string ext_of(const std::string& p) { std::string b = basename_of(p); size_t k = b.rfind('.'); return k == std::string::npos ? "" : lower(b.substr(k + 1)); }
@@ -122,6 +124,35 @@ int abi_rank(const std::string& a) {
 struct AbiLess { bool operator()(const std::string& a, const std::string& b) const { int x = abi_rank(a), y = abi_rank(b); return x != y ? x < y : a < b; } };
 typedef std::set<std::string, AbiLess> AbiSet;
 // lib/<abi>/<file> (APK) or <module>/lib/<abi>/<file> (AAB)
+const char* abi_from_elf(int cls, int machine) {
+    switch (machine) { case 183: return "arm64-v8a"; case 40: return "armeabi-v7a"; case 62: return "x86_64"; case 3: return "x86"; case 243: return cls == 2 ? "riscv64" : nullptr; case 8: return cls == 2 ? "mips64" : "mips"; }
+    return nullptr;
+}
+// native code that is not in lib/<abi>/: .so in assets/ or nested folders, loaded by the app itself.
+// ABI comes from a path component (".../arm64-v8a/x.so") or from the ELF header.
+void collect_other_abis(const Zip& z, bool aab, AbiSet& out) {
+    size_t probed = 0;
+    for (auto& e : z.entries) {
+        std::string n = lower(e.name);
+        if (!ends_with(n, ".so") && n.find(".so.") == std::string::npos) continue;
+        size_t p = 0;
+        if (aab) { size_t k = n.find('/'); if (k == std::string::npos) continue; p = k + 1; }
+        if (n.compare(p, 4, "lib/") == 0) continue;
+        bool found = false;
+        size_t a = 0;
+        while (a < n.size()) {
+            size_t b = n.find('/', a); if (b == std::string::npos) break;
+            std::string comp = n.substr(a, b - a); std::replace(comp.begin(), comp.end(), '_', '-');
+            if (abi_desc(comp)) { out.insert(comp); found = true; break; }
+            a = b + 1;
+        }
+        if (found || probed >= 64 || e.usize < 64) continue;
+        probed++;
+        std::vector<uint8_t> buf; Bytes v; std::string err;
+        if (z.read(e, buf, v, 64, err) && v.n >= 20 && memcmp(v.p, "\x7f" "ELF", 4) == 0 && v.p[5] == 1)
+            if (const char* ab = abi_from_elf(v.p[4], rd16(v.p + 18))) out.insert(ab);
+    }
+}
 void collect_abis(const Zip& z, bool aab, AbiSet& out) {
     for (auto& e : z.entries) {
         size_t p = 0;
@@ -141,12 +172,21 @@ std::string abi_from_split(const std::string& split) {
     std::replace(n.begin(), n.end(), '_', '-');
     return abi_desc(n) ? n : "";
 }
+bool abi_is64(const std::string& a) { return a == "arm64-v8a" || a == "x86_64" || a == "riscv64" || a == "mips64"; }
+// desc=false: "arm64-v8a, armeabi-v7a"; desc=true: "64-bit: arm64-v8a, x86_64; 32-bit: armeabi-v7a, x86"
 std::string abi_list(const AbiSet& a, bool desc) {
     std::string s;
+    if (!desc) { for (auto& x : a) s += (s.empty() ? "" : ", ") + x; return s; }
+    std::string g64, g32, oth;
     for (auto& x : a) {
-        s += (s.empty() ? "" : ", ") + x;
-        if (desc) { const char* d = abi_desc(x); if (d) s += std::string(" (") + d + ")"; }
+        std::string n = x;
+        if (x == "armeabi" || x == "mips" || x == "mips64") n += T(" (legacy)");
+        std::string& g = !abi_desc(x) ? oth : abi_is64(x) ? g64 : g32;
+        g += (g.empty() ? "" : ", ") + n;
     }
+    if (!g64.empty()) s += std::string(T("64-bit: ")) + g64;
+    if (!g32.empty()) s += (s.empty() ? "" : "; ") + std::string(T("32-bit: ")) + g32;
+    if (!oth.empty()) s += (s.empty() ? "" : "; ") + std::string(T("other: ")) + oth;
     return s;
 }
 
@@ -203,7 +243,32 @@ public:
     std::string pkg, label, version_name, version_code, manifest_err, res_err;
     int min_sdk = -1, target_sdk = -1, max_sdk = -1, compile_sdk = -1;
     std::set<std::string> dex_hits;
-    AbiSet abis; std::string abi_note;
+    AbiSet abis, other_abis; std::string abi_note; bool split_app = false, base_of_container = false;
+    // the architecture line used in the header and in PACKAGE
+    std::string arch_text(bool desc) const {
+        if (!abis.empty()) {
+            std::string s = abi_list(abis, desc);
+            if (desc) s += T(abi_note);
+            if (!other_abis.empty()) s += strf(T("   (+ .so outside lib/: %s)"), abi_list(other_abis, false).c_str());
+            return s;
+        }
+        if (!other_abis.empty()) return strf(T("%s (.so outside lib/, loaded by the app itself)"), abi_list(other_abis, desc).c_str());
+        if (split_app && !base_of_container) return desc ? T("unknown: base APK of a split app, native code (if any) is in config splits") : T("in config splits");
+        return desc ? T("any (no native code)") : T("any");
+    }
+    // manifest says the app is delivered as split APKs (Play), so this base APK alone does not carry the ABI
+    bool detect_split_app() const {
+        const XNode* m = root(); if (!m) return false;
+        if (bval(m, "isSplitRequired") == 1 || A(m, "requiredSplitTypes") || A(m, "splitTypes")) return true;
+        if (const XNode* a = app()) {
+            if (bval(a, "isSplitRequired") == 1) return true;
+            for (auto* md : a->children("meta-data")) {
+                std::string n = val(md, "name", false);
+                if (n == "com.android.vending.splits.required" || n == "com.android.vending.splits" || n == "com.android.dynamic.apk.fused.modules") return true;
+            }
+        }
+        return false;
+    }
     std::vector<std::string> norm_names; // lower-cased names normalized to APK layout
 
     ApkAnalyzer(const Zip& zz, Layout l, const AnalyzeOptions& o, Report& r) : z(zz), L(l), opt(o), rep(r) {}
@@ -296,7 +361,7 @@ public:
         if (b == 1) return "true";
         if (b == 0) return "false";
         if (b == -2) return valr(n, nm);
-        return std::string("(not set") + (def_note ? std::string("; default ") + def_note : std::string()) + ")";
+        return def_note ? strf(T("(not set; default %s)"), def_note) : std::string(T("(not set)"));
     }
     std::string cls(const std::string& n) const {
         if (n.empty()) return n;
@@ -378,7 +443,7 @@ public:
         }
         o.kv("Version name", version_name.empty() ? "-" : (A(m, "versionName") && A(m, "versionName")->type == RT_REFERENCE ? valr(m, "versionName") : version_name));
         o.kv("Version code", version_code.empty() ? "-" : version_code);
-        o.kv("Architecture", abis.empty() ? std::string("universal (no native code)") : abi_list(abis, true) + abi_note);
+        o.kv("Architecture", arch_text(true));
         o.kv("Min SDK", api_str(min_sdk));
         o.kv("Target SDK", api_str(target_sdk));
         o.kv("Max SDK", max_sdk < 0 ? "-" : api_str(max_sdk));
@@ -388,7 +453,7 @@ public:
         if (A(m, "platformBuildVersionCode") || A(m, "platformBuildVersionName"))
             o.kv("Platform build version", val(m, "platformBuildVersionCode") + " / " + val(m, "platformBuildVersionName"));
         int il = ival(m, "installLocation", -1);
-        o.kv("Install location", il < 0 ? "(not set; default internalOnly)" : il == 0 ? "auto" : il == 1 ? "internalOnly" : il == 2 ? "preferExternal" : strf("%d", il));
+        o.kv("Install location", il < 0 ? T("(not set; default internalOnly)") : il == 0 ? "auto" : il == 1 ? "internalOnly" : il == 2 ? "preferExternal" : strf("%d", il));
         o.kv("Shared user ID", A(m, "sharedUserId") ? val(m, "sharedUserId") : "-");
         if (A(m, "sharedUserLabel")) o.kv("Shared user label", valr(m, "sharedUserLabel"));
         if (A(m, "sharedUserMaxSdkVersion")) o.kv("sharedUserMaxSdkVersion", val(m, "sharedUserMaxSdkVersion"));
@@ -397,9 +462,9 @@ public:
         if (A(m, "isSplitRequired")) o.kv("Split required", val(m, "isSplitRequired"));
         if (A(m, "requiredSplitTypes")) o.kv("Required split types", val(m, "requiredSplitTypes"));
         if (A(m, "splitTypes")) o.kv("Split types", val(m, "splitTypes"));
-        if (!a) { o.line("(no <application> element)"); return; }
+        if (!a) { o.line(T("(no <application> element)")); return; }
         o.blank();
-        o.kv("Application class", A(a, "name") ? cls(val(a, "name")) : "(default android.app.Application)");
+        o.kv("Application class", A(a, "name") ? cls(val(a, "name")) : T("(default android.app.Application)"));
         o.kv("appComponentFactory", A(a, "appComponentFactory") ? val(a, "appComponentFactory") : "-");
         o.kv("Icon", A(a, "icon") ? valr(a, "icon") : "-");
         if (A(a, "roundIcon")) o.kv("Round icon", valr(a, "roundIcon"));
@@ -427,7 +492,7 @@ public:
             bool k = false; for (int i = 0; known[i]; i++) if (x.name == known[i]) k = true;
             if (!k) other.push_back({ x.name, sanitize_utf8(format_value(x, res.get())) });
         }
-        if (!other.empty()) { o.line("Other <application> attributes:"); for (auto& p : other) o.kv(p.first, p.second, 4); }
+        if (!other.empty()) { o.line(T("Other <application> attributes:")); for (auto& p : other) o.kv(p.first, p.second, 4); }
         static const char* mknown[] = { "package","versionCode","versionName","versionCodeMajor","compileSdkVersion","compileSdkVersionCodename",
             "platformBuildVersionCode","platformBuildVersionName","installLocation","sharedUserId","sharedUserLabel","sharedUserMaxSdkVersion",
             "split","isFeatureSplit","isSplitRequired","requiredSplitTypes","splitTypes", nullptr };
@@ -436,7 +501,7 @@ public:
             bool k = false; for (int i = 0; mknown[i]; i++) if (x.name == mknown[i]) k = true;
             if (!k) other.push_back({ x.name, sanitize_utf8(format_value(x, res.get())) });
         }
-        if (!other.empty()) { o.line("Other <manifest> attributes:"); for (auto& p : other) o.kv(p.first, p.second, 4); }
+        if (!other.empty()) { o.line(T("Other <manifest> attributes:")); for (auto& p : other) o.kv(p.first, p.second, 4); }
     }
 
     // ------------------------------------------------------------ PERMISSIONS / FEATURES
@@ -445,19 +510,21 @@ public:
         std::vector<const XNode*> up = m->children("uses-permission");
         for (auto* x : m->children("uses-permission-sdk-23")) up.push_back(x);
         for (auto* x : m->children("uses-permission-sdk-m")) up.push_back(x);
-        o.sec(strf("PERMISSIONS (%zu requested)", up.size()));
+        o.sec(strf(T("PERMISSIONS (%zu requested)"), up.size()));
         std::map<std::string, int> cnt;
         for (auto* p : up) {
             std::string n = val(p, "name");
             const char* c = permission_class(n);
-            cnt[c ? c : "other/custom"]++;
+            cnt[T(c ? c : "other/custom")]++;
             std::string ex;
             if (p->name != "uses-permission") ex += "  [" + p->name + "]";
             if (A(p, "maxSdkVersion")) ex += "  maxSdkVersion=" + val(p, "maxSdkVersion");
             if (A(p, "minSdkVersion")) ex += "  minSdkVersion=" + val(p, "minSdkVersion");
             if (const XAttr* f = A(p, "usesPermissionFlags")) ex += (f->data & 0x10000) ? std::string("  neverForLocation") : "  usesPermissionFlags=" + val(p, "usesPermissionFlags");
             if (A(p, "requiredFeature")) ex += "  requiredFeature=" + val(p, "requiredFeature");
-            o.line(pad(n, 58) + pad(c ? c : "", 21) + ex);
+            std::string ln = pad(n, 58) + pad(c ? T(c) : "", 21) + ex;
+            while (!ln.empty() && ln.back() == ' ') ln.pop_back();
+            o.line(ln);
         }
         if (!cnt.empty()) {
             std::string s; for (auto& kv : cnt) s += (s.empty() ? "" : ", ") + strf("%d %s", kv.second, kv.first.c_str());
@@ -465,7 +532,7 @@ public:
         }
         auto decl = m->children("permission");
         if (!decl.empty()) {
-            o.line(strf("Declared permissions (%zu):", decl.size()));
+            o.line(strf(T("Declared permissions (%zu):"), decl.size()));
             for (auto* p : decl) {
                 const XAttr* pl = A(p, "protectionLevel");
                 o.line(pad(val(p, "name"), 58) + (pl ? protection_level_string(pl->data) : std::string("normal")) + (A(p, "permissionGroup") ? "  group=" + val(p, "permissionGroup") : ""), 4);
@@ -485,9 +552,9 @@ public:
     void features_section(Out& o) {
         const XNode* m = root();
         auto f = m->children("uses-feature");
-        o.sec(strf("FEATURES (%zu)", f.size()));
+        o.sec(strf(T("FEATURES (%zu)"), f.size()));
         for (auto* x : f) {
-            std::string reqs = bval(x, "required") == 0 ? "optional" : "required";
+            std::string reqs = T(bval(x, "required") == 0 ? "optional" : "required");
             if (A(x, "glEsVersion")) {
                 uint32_t v = A(x, "glEsVersion")->data;
                 o.line(pad(strf("OpenGL ES %u.%u", v >> 16, v & 0xFFFF), 58) + reqs);
@@ -496,7 +563,7 @@ public:
         for (const char* t : { "supports-screens", "compatible-screens", "uses-configuration", "supports-gl-texture" }) {
             for (auto* x : m->children(t)) {
                 std::string s = attr_list(x);
-                o.kv("<" + std::string(t) + ">", s.empty() ? "(no attributes)" : s);
+                o.kv("<" + std::string(t) + ">", s.empty() ? std::string(T("(no attributes)")) : s);
                 for (auto& k : x->kids) o.line("<" + k->name + "> " + attr_list(k.get()), 4);
             }
         }
@@ -506,15 +573,15 @@ public:
         const XNode* m = root(); const XNode* a = app();
         if (a) {
             auto md = a->children("meta-data");
-            o.sec(strf("APPLICATION META-DATA (%zu)", md.size()));
+            o.sec(strf(T("APPLICATION META-DATA (%zu)"), md.size()));
             for (auto* x : md) o.line(pad(val(x, "name", false), 56) + (A(x, "value") ? valr(x, "value") : A(x, "resource") ? "resource " + valr(x, "resource") : std::string()));
             for (auto* p : a->children("property")) o.line(pad("property " + val(p, "name", false), 56) + (A(p, "value") ? valr(p, "value") : valr(p, "resource")));
             auto ul = a->children("uses-library"); auto unl = a->children("uses-native-library");
             auto usl = a->children("uses-static-library"); auto usdk = a->children("uses-sdk-library");
             if (!ul.empty() || !unl.empty() || !usl.empty() || !usdk.empty()) {
                 o.sec("LIBRARIES (uses-library)");
-                for (auto* x : ul) o.line(pad(val(x, "name"), 56) + (bval(x, "required") == 0 ? "optional" : "required"));
-                for (auto* x : unl) o.line(pad(val(x, "name"), 56) + (bval(x, "required") == 0 ? "optional" : "required") + "  [native]");
+                for (auto* x : ul) o.line(pad(val(x, "name"), 56) + T(bval(x, "required") == 0 ? "optional" : "required"));
+                for (auto* x : unl) o.line(pad(val(x, "name"), 56) + T(bval(x, "required") == 0 ? "optional" : "required") + "  [native]");
                 for (auto* x : usl) o.line(pad(val(x, "name"), 56) + "static  version=" + val(x, "version"));
                 for (auto* x : usdk) o.line(pad(val(x, "name"), 56) + "sdk  versionMajor=" + val(x, "versionMajor"));
             }
@@ -553,19 +620,19 @@ public:
             size_t sl = r.find('/'); if (sl == std::string::npos || sl + 1 >= r.size()) continue;
             abis[r.substr(0, sl)].push_back({ r.substr(sl + 1), &e });
         }
-        o.sec(strf("NATIVE LIBRARIES (%zu ABIs)", abis.size()));
-        if (abis.empty()) { o.line("none (pure Java/Kotlin, or native code is in split APKs)"); return; }
+        o.sec(strf(T("NATIVE LIBRARIES (%zu ABIs)"), abis.size()));
+        if (abis.empty()) { o.line(T("none (pure Java/Kotlin, or native code is in split APKs)")); return; }
         std::string list; for (auto& a : abis) list += (list.empty() ? "" : ", ") + a.first;
         o.kv("ABIs", list);
         size_t checked = 0;
         for (auto& a : abis) {
             uint64_t tot = 0; for (auto& l : a.second) tot += l.e->usize;
             bool is64 = a.first == "arm64-v8a" || a.first == "x86_64" || a.first == "riscv64";
-            o.line(strf("%s: %zu files, %s", a.first.c_str(), a.second.size(), short_size(tot).c_str()));
+            o.line(strf(T("%s: %zu files, %s"), a.first.c_str(), a.second.size(), short_size(tot).c_str()));
             int bad16 = 0, so_count = 0;
             for (auto& l : a.second) {
                 std::string info;
-                std::string meth = l.e->method == 0 ? "stored" : l.e->method == 8 ? "deflated" : strf("m%u", l.e->method);
+                std::string meth = l.e->method == 0 ? T("stored") : l.e->method == 8 ? T("deflated") : strf("m%u", l.e->method);
                 if (ends_with(lower(l.name), ".so") && checked < 400) {
                     checked++; so_count++;
                     std::vector<uint8_t> buf; Bytes v; std::string err;
@@ -575,12 +642,12 @@ public:
                             info = strf("ELF%d %s", ei.cls == 2 ? 64 : 32, elf_machine(ei.machine));
                             if (ei.have_align) {
                                 info += strf("  align %lluK", (unsigned long long)ei.min_align / 1024);
-                                if (is64 && ei.min_align < 16384) { info += " (not 16KB-ready)"; bad16++; }
+                                if (is64 && ei.min_align < 16384) { info += T(" (not 16KB-ready)"); bad16++; }
                             }
                             if (ei.api >= 0) info += strf("  NDK api %d", ei.api);
                             if (!ei.ndk.empty()) info += " " + ei.ndk;
-                        } else info = "not an ELF file";
-                    } else info = "unreadable: " + err;
+                        } else info = T("not an ELF file");
+                    } else info = T("unreadable: ") + err;
                     if (l.e->method == 0) {
                         uint64_t off = z.data_offset(*l.e);
                         info += off % 16384 == 0 ? "  zip-aligned 16K" : off % 4096 == 0 ? "  zip-aligned 4K" : "  zip-unaligned";
@@ -588,7 +655,7 @@ public:
                 }
                 o.line(pad(l.name, 34) + lpad(short_size(l.e->usize), 11) + "  " + pad(meth, 9) + info, 4);
             }
-            if (is64 && so_count) o.kv("16 KB page size", bad16 ? strf("NOT ready: %d of %d libraries have LOAD alignment < 16 KB", bad16, so_count) : std::string("ready (all LOAD segments >= 16 KB aligned)"), 4);
+            if (is64 && so_count) o.kv("16 KB page size", bad16 ? strf(T("NOT ready: %d of %d libraries have LOAD alignment < 16 KB"), bad16, so_count) : std::string(T("ready (all LOAD segments >= 16 KB aligned)")), 4);
         }
     }
 
@@ -605,18 +672,18 @@ public:
             dex.push_back({ n, &e });
         }
         std::sort(dex.begin(), dex.end(), [](const D& a, const D& b) { return a.num < b.num; });
-        o.sec(strf("DEX (%zu files)", dex.size()));
-        if (dex.empty()) { o.line("no classes*.dex"); return; }
+        o.sec(strf(T("DEX (%zu files)"), dex.size()));
+        if (dex.empty()) { o.line(T("no classes*.dex")); return; }
         uint64_t tc = 0, tm = 0, tf = 0, ts = 0, tsz = 0, scanned = 0;
         std::set<std::string> markers;
-        o.line(pad("File", 18) + lpad("Size", 11) + "  Ver  " + lpad("Classes", 8) + lpad("Methods", 9) + lpad("Fields", 9) + lpad("Strings", 9) + lpad("Types", 8));
+        o.line(pad(T("File"), 18) + lpad(T("Size"), 11) + "  " + pad(T("Ver"), 5) + lpad(T("Classes"), 8) + lpad(T("Methods"), 9) + lpad(T("Fields"), 9) + lpad(T("Strings"), 9) + lpad(T("Types"), 8));
         for (auto& d : dex) {
             std::vector<uint8_t> buf; Bytes v; std::string err;
             bool full = scanned < (160u << 20);
             size_t limit = full ? (size_t)(256u << 20) : 0x70;
             std::string name = basename_of(d.e->name);
-            if (!z.read(*d.e, buf, v, limit, err)) { o.line(pad(name, 18) + "error: " + err); continue; }
-            if (v.n < 0x70 || memcmp(v.p, "dex\n", 4) != 0) { o.line(pad(name, 18) + "not a DEX file"); continue; }
+            if (!z.read(*d.e, buf, v, limit, err)) { o.line(pad(name, 18) + T("error: ") + err); continue; }
+            if (v.n < 0x70 || memcmp(v.p, "dex\n", 4) != 0) { o.line(pad(name, 18) + T("not a DEX file")); continue; }
             std::string ver = sanitize_utf8(std::string((const char*)v.p + 4, 3));
             uint32_t strs = rd32(v.p + 56), types = rd32(v.p + 64), fields = rd32(v.p + 80), methods = rd32(v.p + 88), classes = rd32(v.p + 96);
             tc += classes; tm += methods; tf += fields; ts += strs; tsz += d.e->usize;
@@ -630,18 +697,18 @@ public:
                 for (auto& t : kTech) if (t.kind == 'd' && !dex_hits.count(t.pat) && memfind(v.p, v.n, t.pat, strlen(t.pat))) dex_hits.insert(t.pat);
             }
         }
-        o.kv("Total", strf("%s classes, %s methods, %s fields, %s strings, %s", with_commas(tc).c_str(), with_commas(tm).c_str(), with_commas(tf).c_str(), with_commas(ts).c_str(), short_size(tsz).c_str()));
-        o.kv("Multidex", dex.size() > 1 ? "yes" : "no");
+        o.kv("Total", strf(T("%s classes, %s methods, %s fields, %s strings, %s"), with_commas(tc).c_str(), with_commas(tm).c_str(), with_commas(tf).c_str(), with_commas(ts).c_str(), short_size(tsz).c_str()));
+        o.kv("Multidex", T(dex.size() > 1 ? "yes" : "no"));
         for (auto& m : markers) o.kv("Compiler marker", m);
-        if (markers.empty() && scanned) o.kv("Compiler marker", "none found (dx / old D8, or marker stripped)");
-        if (scanned < tsz) o.line("(library/marker scan covered the first " + short_size(scanned) + " of DEX code)");
+        if (markers.empty() && scanned) o.kv("Compiler marker", T("none found (dx / old D8, or marker stripped)"));
+        if (scanned < tsz) o.line(strf(T("(library/marker scan covered the first %s of DEX code)"), short_size(scanned).c_str()));
         std::vector<std::string> extra;
         for (auto& e : z.entries) {
             std::string n = lower(e.name);
             if ((ends_with(n, ".dex") && n.find("classes") == std::string::npos) || ends_with(n, ".jar") || ends_with(n, ".odex") || ends_with(n, ".vdex") || ends_with(n, ".oat"))
                 if (extra.size() < 30) extra.push_back(e.name + "  " + short_size(e.usize));
         }
-        if (!extra.empty()) { o.line("Other code files (dynamic loading / packer?):"); for (auto& x : extra) o.line(x, 4); }
+        if (!extra.empty()) { o.line(T("Other code files (dynamic loading / packer?):")); for (auto& x : extra) o.line(x, 4); }
     }
 
     void tech_section(Out& o) {
@@ -662,16 +729,16 @@ public:
             if (std::find(g.begin(), g.end(), t.name) == g.end()) { g.push_back(t.name); evidence[t.name] = ev; }
         }
         o.sec("FRAMEWORKS & TECHNOLOGIES (heuristic)");
-        if (groups.empty()) o.line("nothing specific detected (plain Android/Java)");
+        if (groups.empty()) o.line(T("nothing specific detected (plain Android/Java)"));
         for (const char* gname : { "Framework", "Language", "Jetpack", "Google", "Library", "SDK", "Protector" }) {
             auto it = groups.find(gname); if (it == groups.end()) continue;
-            for (auto& n : it->second) o.line(pad(std::string(gname) + ":", 12) + pad(n, 34) + "<- " + evidence[n]);
+            for (auto& n : it->second) o.line(pad(std::string(T(gname)) + ":", 14) + pad(n, 34) + "<- " + evidence[n]);
         }
         auto fw = groups.find("Framework");
         if (fw != groups.end() && std::find(fw->second.begin(), fw->second.end(), "Flutter") != fw->second.end()) {
             bool aot = false, jit = false;
             for (auto& n : norm_names) { if (ends_with(n, "/libapp.so")) aot = true; if (n.find("kernel_blob.bin") != std::string::npos) jit = true; }
-            o.kv("Flutter build", aot ? "release/profile (Dart AOT libapp.so)" : jit ? "debug (JIT kernel_blob.bin)" : "unknown");
+            o.kv("Flutter build", aot ? "release/profile (Dart AOT libapp.so)" : jit ? "debug (JIT kernel_blob.bin)" : T("unknown"));
         }
     }
 
@@ -714,15 +781,15 @@ public:
         }
         o.sec("BUILD INFO & BUNDLED LIBRARY VERSIONS");
         for (auto& p : info) o.kv(p.first, p.second);
-        if (kmods) o.kv("Kotlin modules", strf("%zu *.kotlin_module files", kmods));
-        if (info.empty() && libs.empty() && props.empty() && !kmods) { o.line("no build metadata files found"); return; }
+        if (kmods) o.kv("Kotlin modules", strf(T("%zu *.kotlin_module files"), kmods));
+        if (info.empty() && libs.empty() && props.empty() && !kmods) { o.line(T("no build metadata files found")); return; }
         if (!libs.empty()) {
             o.line(strf("META-INF/*.version (%zu):", libs.size()));
             std::sort(libs.begin(), libs.end());
             for (auto& l : libs) o.line(pad(l.first, 56) + l.second, 4);
         }
         if (!props.empty()) {
-            o.line(strf("Root *.properties (Play services / Firebase) (%zu):", props.size()));
+            o.line(strf(T("Root *.properties (Play services / Firebase) (%zu):"), props.size()));
             std::sort(props.begin(), props.end());
             for (auto& l : props) o.line(pad(l.first, 56) + l.second, 4);
         }
@@ -730,12 +797,12 @@ public:
 
     void res_section(Out& o) {
         o.sec("RESOURCES");
-        if (!res) o.kv("Resource table", res_err.empty() ? std::string("not present") : "error: " + res_err);
+        if (!res) o.kv("Resource table", res_err.empty() ? std::string(T("not present")) : T("error: ") + res_err);
         else {
             o.kv("Resource table", res->kind);
             for (auto& p : res->packages) o.kv("Package", strf("0x%02x %s", p.id, p.name.c_str()));
-            if (res->string_pool_size) o.kv("Global string pool", with_commas(res->string_pool_size) + " strings");
-            o.kv("Configurations", with_commas(res->config_count) + " (" + with_commas(res->total_values) + " values)");
+            if (res->string_pool_size) o.kv("Global string pool", strf(T("%s strings"), with_commas(res->string_pool_size).c_str()));
+            o.kv("Configurations", strf(T("%s (%s values)"), with_commas(res->config_count).c_str(), with_commas(res->total_values).c_str()));
             std::string t;
             for (auto& kv : res->type_entries) t += (t.empty() ? "" : ", ") + kv.first + strf(" %zu", kv.second);
             o.kv("Types (entries)", t);
@@ -748,7 +815,7 @@ public:
         for (auto& e : z.entries) {
             if (starts_with(e.name, L.res.c_str())) {
                 std::string r = e.name.substr(L.res.size()); size_t sl = r.find('/');
-                std::string d = sl == std::string::npos ? "(root)" : r.substr(0, sl);
+                std::string d = sl == std::string::npos ? T("(root)") : r.substr(0, sl);
                 dirs[d.substr(0, d.find('-'))]++; tot++;
             } else if (starts_with(e.name, L.assets.c_str())) { assets++; asz += e.usize; }
         }
@@ -756,8 +823,8 @@ public:
             std::string s; for (auto& d : dirs) s += (s.empty() ? "" : ", ") + d.first + strf(" %zu", d.second);
             o.kv("res/ files", strf("%zu: ", tot) + s);
         }
-        o.kv("assets/", strf("%zu files, ", assets) + short_size(asz));
-        o.kv("Manifest XML", L.proto ? std::string("protobuf (aapt2)") : strf("binary, %d strings%s, resource map %d ids", doc.string_count, doc.utf8_pool ? " UTF-8" : " UTF-16", doc.res_map_count));
+        o.kv("assets/", strf(T("%zu files, %s"), assets, short_size(asz).c_str()));
+        o.kv("Manifest XML", L.proto ? std::string("protobuf (aapt2)") : strf(T("binary, %d strings%s, resource map %d ids"), doc.string_count, doc.utf8_pool ? " UTF-8" : " UTF-16", doc.res_map_count));
     }
 };
 
@@ -788,33 +855,26 @@ void zip_section(Out& o, const Zip& z, const std::string& title, bool container 
         if (e.method == 0 && e.usize) { stored++; if (z.data_offset(e) % 4) misaligned++; }
         std::string d = dos_datetime(e.mdate, e.mtime); if (d < mn) mn = d; if (d > mx) mx = d;
     }
-    o.kv("Entries", strf("%zu (%zu directories)", z.entries.size(), dirs));
-    std::string m; for (auto& kv : meth) m += (m.empty() ? "" : ", ") + (kv.first == 0 ? std::string("stored") : kv.first == 8 ? std::string("deflated") : strf("method%u", kv.first)) + strf(" %zu", kv.second);
+    o.kv("Entries", strf(T("%zu (%zu directories)"), z.entries.size(), dirs));
+    std::string m; for (auto& kv : meth) m += (m.empty() ? "" : ", ") + (kv.first == 0 ? std::string(T("stored")) : kv.first == 8 ? std::string(T("deflated")) : strf("method%u", kv.first)) + strf(" %zu", kv.second);
     o.kv("Compression methods", m);
     o.kv("Compressed total", human_size(cs));
-    o.kv("Uncompressed total", human_size(us) + (us ? strf("  (ratio %.1f%%)", 100.0 * (double)cs / (double)us) : ""));
-    o.kv("ZIP64", z.zip64 ? "yes" : "no");
-    o.kv("Central directory", strf("offset %llu, %s", (unsigned long long)z.cd_off, short_size(z.cd_size).c_str()));
+    o.kv("Uncompressed total", human_size(us) + (us ? strf(T("  (ratio %.1f%%)"), 100.0 * (double)cs / (double)us) : ""));
+    o.kv("ZIP64", T(z.zip64 ? "yes" : "no"));
+    o.kv("Central directory", strf(T("offset %llu, %s"), (unsigned long long)z.cd_off, short_size(z.cd_size).c_str()));
     if (!z.comment.empty()) o.kv("Archive comment", sanitize_utf8(z.comment));
     if (enc) o.kv("Encrypted entries", strf("%zu", enc));
-    if (dd) o.kv("Data descriptors", strf("%zu entries", dd));
-    if (utf8) o.kv("UTF-8 name flag", strf("%zu entries", utf8));
-    if (!z.entries.empty()) o.kv("Timestamps", mn == mx ? mn + (mn.compare(0, 10, "1981-01-01") == 0 ? "  (fixed: reproducible AGP/bundletool build)" : "") : mn + " .. " + mx);
-    if (stored && !container) o.kv("zipalign (4-byte)", misaligned ? strf("%zu of %zu stored entries NOT aligned", misaligned, stored) : strf("all %zu stored entries aligned", stored));
+    if (dd) o.kv("Data descriptors", strf(T("%zu entries"), dd));
+    if (utf8) o.kv("UTF-8 name flag", strf(T("%zu entries"), utf8));
+    if (!z.entries.empty()) o.kv("Timestamps", mn == mx ? mn + (mn.compare(0, 10, "1981-01-01") == 0 ? T("  (fixed: reproducible AGP/bundletool build)") : "") : mn + " .. " + mx);
+    if (stored && !container) o.kv("zipalign (4-byte)", misaligned ? strf(T("%zu of %zu stored entries NOT aligned"), misaligned, stored) : strf(T("all %zu stored entries aligned"), stored));
 }
 
-void file_section(Out& o, const std::string& path, Bytes data, const std::string& kind, const AnalyzeOptions& opt) {
+void file_section(Out& o, const std::string& path, Bytes data, const std::string& kind) {
     o.sec("FILE");
     o.kv("Path", path);
     o.kv("Type", kind);
     o.kv("Size", human_size(data.n));
-    if (opt.hashes && data.n <= opt.hash_limit) {
-        Md5 m; Sha1 s1; Sha256 s2;
-        const size_t CH = 1 << 20;
-        for (size_t off = 0; off < data.n; off += CH) { size_t k = std::min(CH, data.n - off); m.update(data.p + off, k); s1.update(data.p + off, k); s2.update(data.p + off, k); }
-        uint8_t a[16], b[20], c[32]; m.final(a); s1.final(b); s2.final(c);
-        o.kv("MD5", hexstr(a, 16)); o.kv("SHA-1", hexstr(b, 20)); o.kv("SHA-256", hexstr(c, 32));
-    } else if (opt.hashes) o.kv("Hashes", "skipped (file larger than " + short_size(opt.hash_limit) + ")");
 }
 
 void set_titles(Report& rep, const ApkAnalyzer& a) {
@@ -822,14 +882,18 @@ void set_titles(Report& rep, const ApkAnalyzer& a) {
     std::string sub = a.pkg;
     if (!a.version_name.empty() || !a.version_code.empty()) sub += "   v" + a.version_name + (a.version_code.empty() ? "" : " (" + a.version_code + ")");
     if (a.min_sdk > 0) sub += strf("   API %d..%d", a.min_sdk, a.target_sdk);
-    sub += "   " + (a.abis.empty() ? std::string("universal") : abi_list(a.abis, false));
     sub += "   " + rep.kind;
     rep.subtitle = sub;
+    rep.arch = strf(T("Architecture: %s"), a.arch_text(false).c_str());
 }
 
 void run_apk(ApkAnalyzer& a, Out& o, bool aab, const AbiSet* split_abis = nullptr) {
     a.find_icon();
     collect_abis(a.z, aab, a.abis);
+    collect_other_abis(a.z, aab, a.other_abis);
+    for (auto& x : a.abis) a.other_abis.erase(x);
+    a.split_app = a.detect_split_app();
+    a.base_of_container = split_abis != nullptr;
     if (split_abis && !split_abis->empty()) {
         bool extra = false;
         for (auto& x : *split_abis) if (a.abis.insert(x).second) extra = true;
@@ -900,7 +964,7 @@ void aab_section(Out& o, const Zip& z) {
                     while (s.next(h)) if (h.num == 1 && h.wt == 2) {
                         PbReader d(h.b); PbField x; uint64_t v = 0; bool neg = false;
                         while (d.next(x)) { if (x.num == 1 && x.wt == 0) v = x.v; if (x.num == 2 && x.wt == 0) neg = x.v != 0; }
-                        dims += (dims.empty() ? "" : ", ") + std::string(neg ? "no " : "") + (v < 8 ? dim[v] : "?");
+                        dims += (dims.empty() ? "" : ", ") + std::string(neg ? T("no ") : "") + (v < 8 ? T(dim[v]) : "?");
                     }
                 }
                 if (!dims.empty()) o.kv("Split dimensions", dims);
@@ -917,14 +981,15 @@ void aab_section(Out& o, const Zip& z) {
 void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Report& rep) {
     auto t0 = std::chrono::steady_clock::now();
     rep = Report();
+    set_lang(opt.lang);
     try {
         Zip z; std::string err;
         Out o;
         if (!z.open(data, err)) {
             rep.kind = "unknown";
-            file_section(o, path, data, "not a ZIP archive", opt);
-            o.line("ERROR: " + err);
-            rep.error = err; rep.summary = o.s; rep.title = basename_of(path); rep.subtitle = "cannot read: " + err;
+            file_section(o, path, data, T("not a ZIP archive"));
+            o.line(T("ERROR: ") + err);
+            rep.error = err; rep.summary = o.s; rep.title = basename_of(path); rep.subtitle = T("cannot read: ") + err;
             rep.manifest = rep.files = "(not available)\n";
             return;
         }
@@ -958,38 +1023,39 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
             return;
         }
 
-        file_section(o, path, data, rep.kind, opt);
+        file_section(o, path, data, rep.kind);
         if (rep.kind == "APK" || rep.kind == "APEX" || rep.kind == "AAB") {
             bool aab = rep.kind == "AAB";
             if (rep.kind == "APEX") apex_section(o, z);
             if (aab) aab_section(o, z);
             ApkAnalyzer a(z, aab ? aab_layout("base/") : apk_layout(), opt, rep);
             if (a.load()) { run_apk(a, o, aab); set_titles(rep, a); if (!opt.summary_only) rep.manifest = to_xml(a.doc, a.res.get()); }
-            else { o.line("ERROR: " + a.manifest_err); rep.error = a.manifest_err; rep.title = basename_of(path); rep.subtitle = a.manifest_err; }
+            else { o.line(T("ERROR: ") + a.manifest_err); rep.error = a.manifest_err; rep.title = basename_of(path); rep.subtitle = a.manifest_err; }
             zip_section(o, z, "ZIP STRUCTURE");
             if (!opt.summary_only) rep.files = files_list(z, basename_of(path));
         } else if (!apks.empty()) {
-            o.sec(rep.kind + " CONTAINER");
+            o.sec(strf(T("%s CONTAINER"), rep.kind.c_str()));
             std::string pkgname;
             for (const char* jn : { "manifest.json", "info.json" }) {
                 std::vector<uint8_t> b;
                 if (!z.read_small(jn, b, 8 << 20)) continue;
                 std::string e2; auto j = json_parse(std::string(b.begin(), b.end()), e2);
-                if (!j) { o.kv(jn, "invalid JSON: " + e2); continue; }
+                if (!j) { o.kv(jn, T("invalid JSON: ") + e2); continue; }
                 o.line(std::string(jn) + ":");
                 std::vector<std::pair<std::string, std::string>> fl; json_flatten(*j, "", fl, 300);
                 for (auto& p : fl) o.kv(p.first, p.second, 4);
                 if (pkgname.empty()) pkgname = j->str("package_name");
                 if (pkgname.empty()) pkgname = j->str("pname");
             }
-            if (const ZipEntry* t = z.find("toc.pb")) o.kv("toc.pb", short_size(t->usize) + " (bundletool BuildApksResult)");
+            if (const ZipEntry* t = z.find("toc.pb")) o.kv("toc.pb", strf(T("%s (bundletool BuildApksResult)"), short_size(t->usize).c_str()));
             const ZipEntry* base = pick_base(pkgname);
-            o.line(strf("APK files (%zu):", apks.size()));
+            o.line(strf(T("APK files (%zu):"), apks.size()));
             uint64_t tot = 0; AbiSet split_abis;
             for (auto* e : apks) {
                 tot += e->usize;
                 std::string extra, splitname; bool have_m = false;
-                if (e->usize < (64u << 20) || e->method == 0) {
+                // stored splits are zero-copy views; deflated ones are only inflated when small (big ones: name only)
+                if (e != base && (e->method == 0 || e->usize < (8u << 20))) {
                     std::vector<uint8_t> sb; Bytes sv; std::string se;
                     if (z.read(*e, sb, sv, 64u << 20, se)) {
                         Zip sz;
@@ -1005,31 +1071,31 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
                         }
                     }
                 }
+                if (e == base) extra = "(base)";
                 if (e != base) { std::string ab = abi_from_split(have_m ? splitname : basename_of(e->name).substr(0, basename_of(e->name).size() - 4)); if (!ab.empty()) split_abis.insert(ab); }
-                o.line(pad(e->name, 46) + lpad(short_size(e->usize), 11) + "  " + pad(split_kind(e->name, splitname, have_m), 10) + sanitize_utf8(extra) + (e == base ? "  <= analyzed below" : ""), 4);
+                o.line(pad(e->name, 46) + lpad(short_size(e->usize), 11) + "  " + pad(T(split_kind(e->name, splitname, e == base || have_m)), 10) + sanitize_utf8(extra) + (e == base ? T("  <= analyzed below") : ""), 4);
             }
             o.kv("APK total", short_size(tot));
             std::vector<std::string> other;
             for (auto& e : z.entries) {
                 std::string n = lower(e.name);
                 if (!ends_with(n, ".apk") && !n.empty() && n.back() != '/' && other.size() < 40)
-                    other.push_back(sanitize_utf8(e.name) + "  " + short_size(e.usize) + (ends_with(n, ".obb") ? "  (OBB expansion file)" : ""));
+                    other.push_back(sanitize_utf8(e.name) + "  " + short_size(e.usize) + (ends_with(n, ".obb") ? T("  (OBB expansion file)") : ""));
             }
-            if (!other.empty()) { o.line("Other files:"); for (auto& x : other) o.line(x, 4); }
+            if (!other.empty()) { o.line(T("Other files:")); for (auto& x : other) o.line(x, 4); }
             zip_section(o, z, "CONTAINER ZIP STRUCTURE", true);
             if (!opt.summary_only) rep.files = files_list(z, basename_of(path));
             std::vector<uint8_t> ib; Bytes iv;
-            if (!z.read(*base, ib, iv, (size_t)1 << 31, err)) { o.line("ERROR reading " + base->name + ": " + err); rep.error = err; }
+            if (!z.read(*base, ib, iv, (size_t)1 << 31, err)) { o.line(T("ERROR: ") + base->name + ": " + err); rep.error = err; }
             else {
                 Zip in;
-                if (!in.open(iv, err)) { o.line("ERROR: " + base->name + ": " + err); rep.error = err; }
+                if (!in.open(iv, err)) { o.line(T("ERROR: ") + base->name + ": " + err); rep.error = err; }
                 else {
-                    o.sec("BASE APK: " + base->name);
+                    o.sec(strf(T("BASE APK: %s"), base->name.c_str()));
                     o.kv("Size", human_size(iv.n));
-                    if (opt.hashes) o.kv("SHA-256", sha256_hex(iv.p, iv.n));
                     ApkAnalyzer a(in, apk_layout(), opt, rep);
                     if (a.load()) { run_apk(a, o, false, &split_abis); set_titles(rep, a); if (!opt.summary_only) rep.manifest = to_xml(a.doc, a.res.get()); }
-                    else { o.line("ERROR: " + a.manifest_err); rep.error = a.manifest_err; }
+                    else { o.line(T("ERROR: ") + a.manifest_err); rep.error = a.manifest_err; }
                     zip_section(o, in, "BASE APK ZIP STRUCTURE");
                     if (!opt.summary_only) rep.files += "\n" + files_list(in, base->name);
                 }
@@ -1037,20 +1103,20 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
             if (rep.icon.empty()) z.read_small("icon.png", rep.icon, 8u << 20);
             if (rep.title.empty()) { rep.title = basename_of(path); rep.subtitle = rep.kind; }
         } else {
-            o.line("This ZIP archive contains neither AndroidManifest.xml nor .apk files.");
+            o.line(T("This ZIP archive contains neither AndroidManifest.xml nor .apk files."));
             zip_section(o, z, "ZIP STRUCTURE");
             if (!opt.summary_only) rep.files = files_list(z, basename_of(path));
-            rep.title = basename_of(path); rep.subtitle = "not an Android package";
+            rep.title = basename_of(path); rep.subtitle = T("not an Android package");
         }
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         o.blank();
-        o.line(strf("APK Lister %s, analysis took %lld ms", apklister_version(), (long long)ms), 0);
+        o.line(strf(T("APK Lister %s, analysis took %lld ms"), apklister_version(), (long long)ms), 0);
         rep.summary = o.s;
         if (!opt.summary_only && rep.manifest.empty()) rep.manifest = "(no decodable AndroidManifest.xml)\n";
         rep.ok = true;
     } catch (const std::bad_alloc&) {
-        rep.error = "out of memory"; rep.summary += "\nERROR: out of memory while analyzing\n";
+        rep.error = "out of memory"; rep.summary += T("\nERROR: out of memory while analyzing\n");
     } catch (...) {
-        rep.error = "internal error"; rep.summary += "\nERROR: internal error while analyzing\n";
+        rep.error = "internal error"; rep.summary += T("\nERROR: internal error while analyzing\n");
     }
 }

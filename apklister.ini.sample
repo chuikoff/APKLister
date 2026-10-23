@@ -1,0 +1,5 @@
+; APK Lister settings (optional). Put next to apklister.wlx / apklister.wlx64.
+[APKLister]
+; auto = follow Total Commander language (wincmd.ini LanguageIni), then Windows UI language
+; ru / en = force the report language
+Language=auto

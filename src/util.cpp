@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "util.h"
+#include "i18n.h"
 #include <cstdarg>
 #include <cstdio>
 #include <algorithm>
@@ -81,11 +82,14 @@ std::string with_commas(uint64_t n) {
 }
 
 std::string human_size(uint64_t n) {
-    if (n < 1024) return strf("%llu B", (unsigned long long)n);
-    const char* u[] = { "KiB", "MiB", "GiB", "TiB" };
+    bool ru = get_lang() == Lang::Ru;
+    const char* b = ru ? "Б" : "B";
+    if (n < 1024) return strf("%llu %s", (unsigned long long)n, b);
+    const char* en[] = { "KiB", "MiB", "GiB", "TiB" };
+    const char* rs[] = { "КиБ", "МиБ", "ГиБ", "ТиБ" };
     double v = (double)n; int i = -1;
     while (v >= 1024 && i < 3) { v /= 1024; i++; }
-    return strf("%.2f %s (%s B)", v, u[i], with_commas(n).c_str());
+    return strf("%.2f %s (%s %s)", v, ru ? rs[i] : en[i], with_commas(n).c_str(), b);
 }
 
 std::string lower(std::string s) { for (auto& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c + 32); return s; }

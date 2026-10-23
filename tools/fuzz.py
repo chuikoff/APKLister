@@ -28,7 +28,7 @@ for i in range(n):
     path = f'/tmp/fuzz/case{ext}'
     open(path, 'wb').write(data)
     try:
-        p = subprocess.run([binary, '-a', '--nohash', path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20)
+        p = subprocess.run([binary, '-a', '--lang', random.choice(['ru','en']), path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20)
         if p.returncode not in (0, 1):
             fails += 1
             keep = f'/tmp/fuzz/crash{fails}{ext}'

@@ -1,6 +1,6 @@
 # APK Lister - Total Commander Lister plugin for Android packages
 # SPDX-License-Identifier: GPL-2.0-or-later
-CORE = util hash inflate zip axml arsc protoxml json tables analyzer
+CORE = util i18n inflate zip axml arsc protoxml json tables analyzer
 CXXFLAGS_COMMON = -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -DUNICODE -D_UNICODE -D__USE_MINGW_ANSI_STDIO=1
 WINLIBS = -lgdi32 -luser32 -lcomctl32 -lole32 -lwindowscodecs -lmsimg32 -luuid -lshlwapi -lcomdlg32
 WINLDFLAGS = -static -static-libgcc -static-libstdc++ -s
@@ -11,6 +11,7 @@ WINDRES32 = i686-w64-mingw32-windres
 WINDRES64 = x86_64-w64-mingw32-windres
 
 B = build
+VERSION = $(shell sed -n 's/.*APKL_VER_STR "\(.*\)"/\1/p' src/version.h)
 CORE_SRC = $(addprefix src/,$(addsuffix .cpp,$(CORE)))
 HDRS = $(wildcard src/*.h) src/android_attrs.inc
 
@@ -51,8 +52,8 @@ asan: | $(B)
 
 dist: all
 	rm -rf $(B)/dist && mkdir -p $(B)/dist
-	cp $(B)/apklister.wlx $(B)/apklister.wlx64 pluginst.inf README.md LICENSE $(B)/dist/
-	cd $(B)/dist && rm -f ../apklister-0.1.1.zip && zip -9 -q ../apklister-0.1.1.zip *
+	cp $(B)/apklister.wlx $(B)/apklister.wlx64 pluginst.inf apklister.ini.sample README.md LICENSE $(B)/dist/
+	cd $(B)/dist && rm -f ../apklister-$(VERSION).zip && zip -9 -q ../apklister-$(VERSION).zip *
 
 clean:
 	rm -rf $(B)

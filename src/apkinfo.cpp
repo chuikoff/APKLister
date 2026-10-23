@@ -11,28 +11,28 @@
 #endif
 
 static int run(int argc, char** argv) {
-    const char* tab = "summary"; const char* file = nullptr; const char* icon_out = nullptr; bool nohash = false;
+    const char* tab = "summary"; const char* file = nullptr; const char* icon_out = nullptr; Lang lang = Lang::En;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m")) tab = "manifest";
         else if (!strcmp(argv[i], "-f")) tab = "files";
         else if (!strcmp(argv[i], "-a")) tab = "all";
-        else if (!strcmp(argv[i], "--nohash")) nohash = true;
+        else if (!strcmp(argv[i], "--nohash")) {} // accepted for compatibility (hashing was removed in 0.1.2)
+        else if (!strcmp(argv[i], "--lang") && i + 1 < argc) { if (!parse_lang(argv[++i], lang)) { fprintf(stderr, "--lang: ru or en\n"); return 2; } }
         else if (!strcmp(argv[i], "--icon") && i + 1 < argc) icon_out = argv[++i];
         else file = argv[i];
     }
     if (!file) {
-        fprintf(stderr, "APK Lister %s - apkinfo\nusage: apkinfo [-m|-f|-a] [--nohash] [--icon out.png] FILE\n"
+        fprintf(stderr, "APK Lister %s - apkinfo\nusage: apkinfo [-m|-f|-a] [--lang ru|en] [--icon out.png] FILE\n"
                         "  FILE: .apk .aab .xapk .apks .apkm .apex\n  default: summary; -m decoded AndroidManifest.xml; -f file list; -a everything\n", apklister_version());
         return 2;
     }
     MappedFile mf; std::string err;
     if (!mf.open(file, err)) { fprintf(stderr, "%s: %s\n", file, err.c_str()); return 1; }
-    AnalyzeOptions opt; opt.hashes = !nohash;
+    AnalyzeOptions opt; opt.lang = lang;
     Report r;
-    if (icon_out && !strcmp(tab, "summary") && nohash) opt.icon_only = false;
     analyze(file, Bytes(mf.p, (size_t)mf.size), opt, r);
     std::string out;
-    if (!strcmp(tab, "summary") || !strcmp(tab, "all")) out += "# " + r.title + "\n# " + r.subtitle + "\n\n" + r.summary;
+    if (!strcmp(tab, "summary") || !strcmp(tab, "all")) out += "# " + r.title + "\n# " + r.subtitle + "\n" + (r.arch.empty() ? std::string() : "# " + r.arch + "\n") + "\n" + r.summary;
     if (!strcmp(tab, "manifest") || !strcmp(tab, "all")) out += r.manifest;
     if (!strcmp(tab, "files") || !strcmp(tab, "all")) out += r.files;
     fwrite(out.data(), 1, out.size(), stdout);

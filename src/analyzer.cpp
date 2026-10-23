@@ -20,21 +20,52 @@ const char* apklister_version() { return APKL_VER_STR; }
 namespace {
 
 const size_t KW = 32;
+bool code_like(const std::string& v) {
+    if (v.empty() || v.size() > 200) return false;
+    bool sep = false;
+    for (unsigned char c : v) {
+        if (c == ' ' || c >= 0x80) return false;
+        if (c == '.' || c == '/' || c == '@' || c == '_' || c == '$') sep = true;
+    }
+    return sep;
+}
 struct Out {
     std::string s;
+    std::vector<ReportItem> items;
+    void push(ReportItem::Kind k, int ind, const std::string& key, const std::string& value, const std::string& plain) {
+        ReportItem it; it.kind = k; it.ind = ind; it.key = key; it.value = value; it.plain = plain;
+        if (k == ReportItem::KV) it.mono = code_like(value);
+        if (k == ReportItem::Line) { it.strong = !value.empty() && value.back() == ':'; it.mono = !it.strong; }
+        if (it.mono && value.find_first_not_of("0123456789.") == std::string::npos) it.mono = false;
+        items.push_back(std::move(it));
+    }
     void sec(const std::string& t) {
         if (!s.empty()) s += "\n";
         std::string h = "== " + T(t) + " "; size_t w = u8len(h); while (w++ < 78) h += '=';
         s += h + "\n";
+        push(ReportItem::Section, 0, T(t), "", h);
     }
     void kv(const std::string& k, const std::string& v, int ind = 2) {
         std::string l((size_t)ind, ' '); l += T(k);
         size_t w = u8len(l);
         if (w < KW) l.append(KW - w, ' '); else l += ' ';
         s += l + v + "\n";
+        push(ReportItem::KV, ind, T(k), v, l + v);
     }
-    void line(const std::string& t, int ind = 2) { s += std::string((size_t)ind, ' ') + t + "\n"; }
-    void blank() { s += "\n"; }
+    void line(const std::string& t, int ind = 2) {
+        std::string l = std::string((size_t)ind, ' ') + t;
+        s += l + "\n";
+        push(ReportItem::Line, ind, "", t, l);
+    }
+    void blank() { s += "\n"; push(ReportItem::Blank, 0, "", "", ""); }
+    // refine how the last item is shown in the drawn view (text report unchanged)
+    ReportItem& last() { static ReportItem dummy; return items.empty() ? dummy : items.back(); }
+    void view(const std::string& text, const std::string& tag = "", int tag_kind = ReportItem::TagNone) {
+        ReportItem& it = last(); it.value = text; it.tag = tag; it.tag_kind = tag_kind;
+    }
+    void view_kv(const std::string& key, const std::string& value, const std::string& note) {
+        ReportItem& it = last(); it.kind = ReportItem::KV; it.key = key; it.value = value; it.note = note; it.mono = false;
+    }
 };
 
 std::string pad(const std::string& s, size_t w) { size_t n = u8len(s); return n >= w ? s + " " : s + std::string(w - n, ' '); }
@@ -511,6 +542,7 @@ public:
         for (auto* x : m->children("uses-permission-sdk-23")) up.push_back(x);
         for (auto* x : m->children("uses-permission-sdk-m")) up.push_back(x);
         o.sec(strf(T("PERMISSIONS (%zu requested)"), up.size()));
+        rep.facts.perms = (int)up.size(); rep.facts.perms_danger = 0;
         std::map<std::string, int> cnt;
         for (auto* p : up) {
             std::string n = val(p, "name");
@@ -525,6 +557,10 @@ public:
             std::string ln = pad(n, 58) + pad(c ? T(c) : "", 21) + ex;
             while (!ln.empty() && ln.back() == ' ') ln.pop_back();
             o.line(ln);
+            int tk = !c ? ReportItem::TagMuted : !strcmp(c, "DANGEROUS") ? ReportItem::TagDanger : !strcmp(c, "special access") ? ReportItem::TagSpecial :
+                     !strcmp(c, "signature/privileged") ? ReportItem::TagSignature : ReportItem::TagNormal;
+            o.view(n + ex, T(c ? c : "other/custom"), tk);
+            if (c && !strcmp(c, "DANGEROUS")) rep.facts.perms_danger++;
         }
         if (!cnt.empty()) {
             std::string s; for (auto& kv : cnt) s += (s.empty() ? "" : ", ") + strf("%d %s", kv.second, kv.first.c_str());
@@ -535,7 +571,10 @@ public:
             o.line(strf(T("Declared permissions (%zu):"), decl.size()));
             for (auto* p : decl) {
                 const XAttr* pl = A(p, "protectionLevel");
-                o.line(pad(val(p, "name"), 58) + (pl ? protection_level_string(pl->data) : std::string("normal")) + (A(p, "permissionGroup") ? "  group=" + val(p, "permissionGroup") : ""), 4);
+                std::string plv = pl ? protection_level_string(pl->data) : std::string("normal");
+                std::string grp = A(p, "permissionGroup") ? "  group=" + val(p, "permissionGroup") : "";
+                o.line(pad(val(p, "name"), 58) + plv + grp, 4);
+                o.view(val(p, "name") + grp, plv, plv.find("dangerous") != std::string::npos ? ReportItem::TagDanger : plv.find("signature") != std::string::npos ? ReportItem::TagSignature : ReportItem::TagNormal);
             }
         }
         for (const char* t : { "permission-group", "permission-tree" }) {
@@ -558,7 +597,12 @@ public:
             if (A(x, "glEsVersion")) {
                 uint32_t v = A(x, "glEsVersion")->data;
                 o.line(pad(strf("OpenGL ES %u.%u", v >> 16, v & 0xFFFF), 58) + reqs);
-            } else o.line(pad(val(x, "name"), 58) + reqs + (A(x, "version") ? "  version=" + val(x, "version") : ""));
+                o.view(strf("OpenGL ES %u.%u", v >> 16, v & 0xFFFF), reqs, bval(x, "required") == 0 ? ReportItem::TagMuted : ReportItem::TagInfo);
+            } else {
+                std::string ver = A(x, "version") ? "  version=" + val(x, "version") : "";
+                o.line(pad(val(x, "name"), 58) + reqs + ver);
+                o.view(val(x, "name") + ver, reqs, bval(x, "required") == 0 ? ReportItem::TagMuted : ReportItem::TagInfo);
+            }
         }
         for (const char* t : { "supports-screens", "compatible-screens", "uses-configuration", "supports-gl-texture" }) {
             for (auto* x : m->children(t)) {
@@ -629,9 +673,10 @@ public:
             uint64_t tot = 0; for (auto& l : a.second) tot += l.e->usize;
             bool is64 = a.first == "arm64-v8a" || a.first == "x86_64" || a.first == "riscv64";
             o.line(strf(T("%s: %zu files, %s"), a.first.c_str(), a.second.size(), short_size(tot).c_str()));
+            o.last().strong = true; o.last().mono = false;
             int bad16 = 0, so_count = 0;
             for (auto& l : a.second) {
-                std::string info;
+                std::string info; int tag16 = 0;
                 std::string meth = l.e->method == 0 ? T("stored") : l.e->method == 8 ? T("deflated") : strf("m%u", l.e->method);
                 if (ends_with(lower(l.name), ".so") && checked < 400) {
                     checked++; so_count++;
@@ -642,7 +687,8 @@ public:
                             info = strf("ELF%d %s", ei.cls == 2 ? 64 : 32, elf_machine(ei.machine));
                             if (ei.have_align) {
                                 info += strf("  align %lluK", (unsigned long long)ei.min_align / 1024);
-                                if (is64 && ei.min_align < 16384) { info += T(" (not 16KB-ready)"); bad16++; }
+                                if (is64 && ei.min_align < 16384) { info += T(" (not 16KB-ready)"); bad16++; tag16 = 2; }
+                                else if (is64) tag16 = 1;
                             }
                             if (ei.api >= 0) info += strf("  NDK api %d", ei.api);
                             if (!ei.ndk.empty()) info += " " + ei.ndk;
@@ -654,7 +700,9 @@ public:
                     }
                 }
                 o.line(pad(l.name, 34) + lpad(short_size(l.e->usize), 11) + "  " + pad(meth, 9) + info, 4);
+                if (tag16) o.view(o.last().value, tag16 == 1 ? T("16 KB ✓") : T("16 KB ✗"), tag16 == 1 ? ReportItem::TagOk : ReportItem::TagBad);
             }
+            if (is64 && so_count) rep.facts.page16 = (bad16 || rep.facts.page16 == 2) ? 2 : 1;
             if (is64 && so_count) o.kv("16 KB page size", bad16 ? strf(T("NOT ready: %d of %d libraries have LOAD alignment < 16 KB"), bad16, so_count) : std::string(T("ready (all LOAD segments >= 16 KB aligned)")), 4);
         }
     }
@@ -699,6 +747,13 @@ public:
         }
         o.kv("Total", strf(T("%s classes, %s methods, %s fields, %s strings, %s"), with_commas(tc).c_str(), with_commas(tm).c_str(), with_commas(tf).c_str(), with_commas(ts).c_str(), short_size(tsz).c_str()));
         o.kv("Multidex", T(dex.size() > 1 ? "yes" : "no"));
+        rep.facts.dex_files = (int)dex.size(); rep.facts.dex_classes = tc; rep.facts.dex_methods = tm;
+        for (auto& m : markers) if (rep.facts.compiler.empty()) {
+            std::string c = m.compare(0, 4, "~~R8") == 0 ? "R8" : m.compare(0, 4, "~~D8") == 0 ? "D8" : "L8";
+            size_t k = m.find("\"compilation-mode\":\"");
+            if (k != std::string::npos) { size_t e = m.find('"', k + 20); if (e != std::string::npos) c += " " + m.substr(k + 20, e - k - 20); }
+            rep.facts.compiler = c;
+        }
         for (auto& m : markers) o.kv("Compiler marker", m);
         if (markers.empty() && scanned) o.kv("Compiler marker", T("none found (dx / old D8, or marker stripped)"));
         if (scanned < tsz) o.line(strf(T("(library/marker scan covered the first %s of DEX code)"), short_size(scanned).c_str()));
@@ -732,7 +787,10 @@ public:
         if (groups.empty()) o.line(T("nothing specific detected (plain Android/Java)"));
         for (const char* gname : { "Framework", "Language", "Jetpack", "Google", "Library", "SDK", "Protector" }) {
             auto it = groups.find(gname); if (it == groups.end()) continue;
-            for (auto& n : it->second) o.line(pad(std::string(T(gname)) + ":", 14) + pad(n, 34) + "<- " + evidence[n]);
+            for (auto& n : it->second) {
+                o.line(pad(std::string(T(gname)) + ":", 14) + pad(n, 34) + "<- " + evidence[n]);
+                o.view_kv(T(gname), n, "← " + evidence[n]);
+            }
         }
         auto fw = groups.find("Framework");
         if (fw != groups.end() && std::find(fw->second.begin(), fw->second.end(), "Flutter") != fw->second.end()) {
@@ -764,7 +822,7 @@ public:
                             std::string v;
                             for (auto& l : split_lines(s)) { l = trim(l); if (l.find(':') != std::string::npos) v += (v.empty() ? "" : "; ") + l; }
                             info.push_back({ "VCS info", v });
-                        } else for (auto& l : split_lines(s)) { l = trim(l); if (!l.empty() && l[0] != '#') info.push_back({ "app-metadata", l }); }
+                        } else for (auto& l : split_lines(s)) { l = trim(l); if (!l.empty() && l[0] != '#') { info.push_back({ "app-metadata", l }); if (starts_with(l, "androidGradlePluginVersion=")) rep.facts.agp = l.substr(27); } }
                     }
                 }
             } else if (starts_with(e.name, L.root.c_str())) {
@@ -842,7 +900,7 @@ std::string files_list(const Zip& z, const std::string& title) {
     return o;
 }
 
-void zip_section(Out& o, const Zip& z, const std::string& title, bool container = false) {
+void zip_section(Out& o, const Zip& z, const std::string& title, bool container = false, ReportFacts* facts = nullptr) {
     o.sec(title);
     std::map<uint16_t, size_t> meth; uint64_t cs = 0, us = 0; size_t enc = 0, dd = 0, dirs = 0, stored = 0, misaligned = 0, utf8 = 0;
     std::string mn = "9999", mx = "0000";
@@ -859,6 +917,7 @@ void zip_section(Out& o, const Zip& z, const std::string& title, bool container 
     std::string m; for (auto& kv : meth) m += (m.empty() ? "" : ", ") + (kv.first == 0 ? std::string(T("stored")) : kv.first == 8 ? std::string(T("deflated")) : strf("method%u", kv.first)) + strf(" %zu", kv.second);
     o.kv("Compression methods", m);
     o.kv("Compressed total", human_size(cs));
+    if (facts) facts->usize = us;
     o.kv("Uncompressed total", human_size(us) + (us ? strf(T("  (ratio %.1f%%)"), 100.0 * (double)cs / (double)us) : ""));
     o.kv("ZIP64", T(z.zip64 ? "yes" : "no"));
     o.kv("Central directory", strf(T("offset %llu, %s"), (unsigned long long)z.cd_off, short_size(z.cd_size).c_str()));
@@ -885,6 +944,13 @@ void set_titles(Report& rep, const ApkAnalyzer& a) {
     sub += "   " + rep.kind;
     rep.subtitle = sub;
     rep.arch = strf(T("Architecture: %s"), a.arch_text(false).c_str());
+    ReportFacts& f = rep.facts;
+    f.have = true; f.package = a.pkg; f.version = a.version_name; f.version_code = a.version_code;
+    f.min_sdk = a.min_sdk; f.target_sdk = a.target_sdk;
+    f.abis.assign(a.abis.begin(), a.abis.end());
+    if (!a.abis.empty()) f.arch_state = 1;
+    else if (!a.other_abis.empty()) { f.arch_state = 3; f.abis.assign(a.other_abis.begin(), a.other_abis.end()); }
+    else f.arch_state = (a.split_app && !a.base_of_container) ? 2 : 0;
 }
 
 void run_apk(ApkAnalyzer& a, Out& o, bool aab, const AbiSet* split_abis = nullptr) {
@@ -989,7 +1055,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
             rep.kind = "unknown";
             file_section(o, path, data, T("not a ZIP archive"));
             o.line(T("ERROR: ") + err);
-            rep.error = err; rep.summary = o.s; rep.title = basename_of(path); rep.subtitle = T("cannot read: ") + err;
+            rep.error = err; rep.summary = o.s; rep.items = std::move(o.items); rep.title = basename_of(path); rep.subtitle = T("cannot read: ") + err;
             rep.manifest = rep.files = "(not available)\n";
             return;
         }
@@ -1024,6 +1090,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
         }
 
         file_section(o, path, data, rep.kind);
+        rep.facts.size = data.n;
         if (rep.kind == "APK" || rep.kind == "APEX" || rep.kind == "AAB") {
             bool aab = rep.kind == "AAB";
             if (rep.kind == "APEX") apex_section(o, z);
@@ -1031,7 +1098,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
             ApkAnalyzer a(z, aab ? aab_layout("base/") : apk_layout(), opt, rep);
             if (a.load()) { run_apk(a, o, aab); set_titles(rep, a); if (!opt.summary_only) rep.manifest = to_xml(a.doc, a.res.get()); }
             else { o.line(T("ERROR: ") + a.manifest_err); rep.error = a.manifest_err; rep.title = basename_of(path); rep.subtitle = a.manifest_err; }
-            zip_section(o, z, "ZIP STRUCTURE");
+            zip_section(o, z, "ZIP STRUCTURE", false, &rep.facts);
             if (!opt.summary_only) rep.files = files_list(z, basename_of(path));
         } else if (!apks.empty()) {
             o.sec(strf(T("%s CONTAINER"), rep.kind.c_str()));
@@ -1076,6 +1143,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
                 o.line(pad(e->name, 46) + lpad(short_size(e->usize), 11) + "  " + pad(T(split_kind(e->name, splitname, e == base || have_m)), 10) + sanitize_utf8(extra) + (e == base ? T("  <= analyzed below") : ""), 4);
             }
             o.kv("APK total", short_size(tot));
+            rep.facts.apk_count = (int)apks.size();
             std::vector<std::string> other;
             for (auto& e : z.entries) {
                 std::string n = lower(e.name);
@@ -1112,6 +1180,7 @@ void analyze(const std::string& path, Bytes data, const AnalyzeOptions& opt, Rep
         o.blank();
         o.line(strf(T("APK Lister %s, analysis took %lld ms"), apklister_version(), (long long)ms), 0);
         rep.summary = o.s;
+        rep.items = std::move(o.items);
         if (!opt.summary_only && rep.manifest.empty()) rep.manifest = "(no decodable AndroidManifest.xml)\n";
         rep.ok = true;
     } catch (const std::bad_alloc&) {

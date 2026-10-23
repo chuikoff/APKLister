@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 CORE = util i18n inflate zip axml arsc protoxml json tables analyzer
 CXXFLAGS_COMMON = -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -DUNICODE -D_UNICODE -D__USE_MINGW_ANSI_STDIO=1
-WINLIBS = -lgdi32 -luser32 -lcomctl32 -lole32 -lwindowscodecs -lmsimg32 -luuid -lshlwapi -lcomdlg32
+WINLIBS = -lgdi32 -luser32 -lcomctl32 -lole32 -lwindowscodecs -lmsimg32 -luuid -lshlwapi -lcomdlg32 -lgdiplus
 WINLDFLAGS = -static -static-libgcc -static-libstdc++ -s
 
 CXX32 = i686-w64-mingw32-g++

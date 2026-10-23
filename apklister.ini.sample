@@ -3,3 +3,6 @@
 ; auto = follow Total Commander language (wincmd.ini LanguageIni), then Windows UI language
 ; ru / en = force the report language
 Language=auto
+; auto = follow Total Commander dark mode (TC 10+), then the Windows app theme
+; light / dark = force
+Theme=auto

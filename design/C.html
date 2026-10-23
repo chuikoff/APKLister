@@ -1,0 +1,89 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>APK Lister — вариант C: bold</title>
+<style>
+/* Variant C: owner-drawn hero band in the icon's dominant color (#1975D0 from the F-Droid icon), stat tiles, compact sections. */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:900px;height:700px;overflow:hidden}
+body{font-family:"Segoe UI","Noto Sans",sans-serif;color:#1f2328;background:#fff;position:relative;font-variant-numeric:tabular-nums}
+.hero{height:132px;background:#1975d0;color:#fff;display:flex;align-items:center;padding:0 22px;gap:18px;position:relative}
+.hero .ic{width:88px;height:88px;background:#fff;border-radius:20px;display:flex;align-items:center;justify-content:center}
+.hero .ic img{width:72px;height:72px}
+.hero .t{font-size:32px;font-weight:700;line-height:38px}
+.hero .s{font-size:13.5px;opacity:.85;margin-top:2px}
+.hero .s b{font-weight:600;opacity:1}
+.hero .lime{display:inline-block;margin-top:9px;background:#ade800;color:#173300;font-weight:700;font-size:12px;line-height:22px;padding:0 10px;border-radius:11px}
+.hero .ver{position:absolute;right:18px;top:12px;font-size:11px;color:#cfe3f8}
+.tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;padding:12px 14px 4px;margin-right:17px}
+.tile{background:#f2f7fd;border:1px solid #dbe8f6;border-radius:8px;padding:8px 10px 9px;min-width:0}
+.tile .l{font-size:10.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:#5d7690}
+.tile .n{font-size:21px;font-weight:700;line-height:28px;color:#0d46a0;white-space:nowrap}
+.tile .h{font-size:11px;color:#6e7781;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile.warn{background:#fff3f1;border-color:#ffd9d4}.tile.warn .n{color:#c4231c}.tile.warn .l{color:#a3554d}
+.tile.ok{background:#f1faea;border-color:#d8eec6}.tile.ok .n{color:#2f6b00}.tile.ok .l{color:#5b7a43}
+.body{position:absolute;top:226px;left:0;right:17px;bottom:0;overflow:hidden;padding:4px 14px 0 14px;display:grid;grid-template-columns:1.05fr 1fr;column-gap:22px;align-content:start}
+.sec{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#1975d0;border-bottom:2px solid #1975d0;padding:8px 0 3px;margin-bottom:5px;display:flex;justify-content:space-between}
+.sec span{color:#8c959f;font-weight:600;letter-spacing:0;text-transform:none}
+.row{display:flex;font-size:12.5px;line-height:20px}
+.row .k{width:132px;color:#6e7781;flex:none}
+.row .v{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mono{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}
+.mut{color:#8c959f}
+.p{display:flex;justify-content:space-between;font-size:12px;line-height:20px}
+.p .n{font-family:Consolas,"Cascadia Mono",monospace;font-size:11.5px;white-space:pre}
+.tag{font-size:10.5px;font-weight:700;border-radius:4px;padding:0 6px;line-height:17px;margin-top:1.5px}
+.d{background:#ffe8e6;color:#c4231c}.sp{background:#fff0e0;color:#9a4300}.ok2{background:#e8f5dc;color:#2f6b00}
+.badges{display:flex;flex-wrap:wrap;gap:5px;margin-top:2px}
+.bd{font-size:11.5px;line-height:21px;padding:0 8px;border-radius:11px;background:#eef3f8;color:#24405e;font-weight:600}
+.bd.k{background:#1975d0;color:#fff}
+.vs{position:absolute;right:0;top:132px;width:17px;bottom:0;background:#f0f0f0;border-left:1px solid #e3e3e3}
+.vs i{position:absolute;left:3px;right:3px;top:18px;height:110px;background:#c2c2c2;border-radius:2px}
+</style></head><body>
+<div class="hero"><div class="ic"><img src="fdroid-icon.png"></div>
+ <div><div class="t">F-Droid</div><div class="s"><b>org.fdroid.fdroid</b> &nbsp;·&nbsp; APK &nbsp;·&nbsp; R8 release &nbsp;·&nbsp; AGP 9.2.1</div>
+ <span class="lime">64-бит: arm64-v8a, x86_64 &nbsp;·&nbsp; 32-бит: armeabi-v7a, x86</span></div>
+ <div class="ver">APK Lister 0.1.2</div></div>
+<div class="tiles">
+ <div class="tile"><div class="l">Версия</div><div class="n">2.0.2</div><div class="h">код 2000052</div></div>
+ <div class="tile"><div class="l">API</div><div class="n">24 → 37</div><div class="h">Android 7.0 → 17</div></div>
+ <div class="tile ok"><div class="l">Архитектура</div><div class="n">4 ABI</div><div class="h">16 КБ страницы ✓</div></div>
+ <div class="tile"><div class="l">Размер</div><div class="n">12.0 МиБ</div><div class="h">24.4 МиБ без сжатия</div></div>
+ <div class="tile warn"><div class="l">Разрешения</div><div class="n">31 / 8</div><div class="h">из них опасных 8</div></div>
+ <div class="tile"><div class="l">DEX</div><div class="n">139.9 K</div><div class="h">методов · 3 файла</div></div>
+</div>
+<div class="body">
+ <div>
+  <div class="sec">Пакет</div>
+  <div class="row"><div class="k">Название</div><div class="v">F-Droid <span class="mut">@string/app_name</span></div></div>
+  <div class="row"><div class="k">Мин. / целевой SDK</div><div class="v">24 Nougat <span class="mut">→</span> 37 Android 17</div></div>
+  <div class="row"><div class="k">SDK компиляции</div><div class="v">37 <span class="mut">· codename 17</span></div></div>
+  <div class="row"><div class="k">Application</div><div class="v mono">org.fdroid.App</div></div>
+  <div class="row"><div class="k">Тема</div><div class="v mono">@style/Theme.FDroid</div></div>
+  <div class="row"><div class="k">usesCleartextTraffic</div><div class="v"><span class="tag sp">true</span></div></div>
+  <div class="row"><div class="k">extractNativeLibs</div><div class="v">false</div></div>
+  <div class="sec">Нативные библиотеки <span>4 ABI · NDK r25c</span></div>
+  <div class="p"><span class="n">arm64-v8a  libandroidx.graphics.path.so</span><span class="tag ok2">16 КБ ✓</span></div>
+  <div class="p"><span class="n">x86_64     libandroidx.graphics.path.so</span><span class="tag ok2">16 КБ ✓</span></div>
+  <div class="p"><span class="n">armeabi-v7a, x86  (32-бит)</span><span class="mut" style="font-size:11.5px">7.1 / 9.1 КиБ</span></div>
+  <div class="sec">DEX <span>3 файла · 19.63 МиБ</span></div>
+  <div class="row"><div class="k">Классы / методы</div><div class="v">24 528 <span class="mut">/</span> 139 895</div></div>
+  <div class="row"><div class="k">Поля / строки</div><div class="v">60 340 <span class="mut">/</span> 137 880</div></div>
+  <div class="row"><div class="k">Компилятор</div><div class="v">R8 9.2.14 <span class="mut">· full · min-api 24</span></div></div>
+ </div>
+ <div>
+  <div class="sec">Разрешения <span>опасные и спец. доступ</span></div>
+  <div class="p"><span class="n">CAMERA</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">POST_NOTIFICATIONS</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">BLUETOOTH_CONNECT / SCAN / ADVERTISE</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">ACCESS_COARSE_LOCATION</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">MANAGE_EXTERNAL_STORAGE</span><span class="tag sp">спец. доступ</span></div>
+  <div class="p"><span class="n">REQUEST_INSTALL_PACKAGES</span><span class="tag sp">спец. доступ</span></div>
+  <div class="sec">Технологии <span>эвристика</span></div>
+  <div class="badges"><span class="bd k">Kotlin</span><span class="bd k">Jetpack Compose</span><span class="bd k">Compose MP</span><span class="bd">Room</span><span class="bd">WorkManager</span><span class="bd">Hilt</span><span class="bd">Ktor</span><span class="bd">OkHttp</span><span class="bd">Coil 3</span><span class="bd">ZXing</span><span class="bd">+8</span></div>
+  <div class="sec">Ресурсы и сборка</div>
+  <div class="row"><div class="k">Локали</div><div class="v">45 <span class="mut">· ru uk be de fr es ja zh…</span></div></div>
+  <div class="row"><div class="k">Плотности</div><div class="v">ldpi … xxxhdpi, anydpi</div></div>
+  <div class="row"><div class="k">Сборка</div><div class="v">AGP 9.2.1 <span class="mut">· git 08f4447</span></div></div>
+  <div class="row"><div class="k">ZIP</div><div class="v">973 записи <span class="mut">· zipalign ✓</span></div></div>
+ </div>
+</div>
+<div class="vs"><i></i></div>
+</body></html>

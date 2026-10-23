@@ -18,6 +18,7 @@ static int run(int argc, char** argv) {
         else if (!strcmp(argv[i], "-a")) tab = "all";
         else if (!strcmp(argv[i], "--nohash")) {} // accepted for compatibility (hashing was removed in 0.1.2)
         else if (!strcmp(argv[i], "--lang") && i + 1 < argc) { if (!parse_lang(argv[++i], lang)) { fprintf(stderr, "--lang: ru or en\n"); return 2; } }
+        else if (!strcmp(argv[i], "--items")) tab = "items"; // debug: structured view items and facts
         else if (!strcmp(argv[i], "--icon") && i + 1 < argc) icon_out = argv[++i];
         else file = argv[i];
     }
@@ -35,6 +36,13 @@ static int run(int argc, char** argv) {
     if (!strcmp(tab, "summary") || !strcmp(tab, "all")) out += "# " + r.title + "\n# " + r.subtitle + "\n" + (r.arch.empty() ? std::string() : "# " + r.arch + "\n") + "\n" + r.summary;
     if (!strcmp(tab, "manifest") || !strcmp(tab, "all")) out += r.manifest;
     if (!strcmp(tab, "files") || !strcmp(tab, "all")) out += r.files;
+    if (!strcmp(tab, "items")) {
+        const ReportFacts& f = r.facts;
+        out += strf("facts have=%d pkg=%s ver=%s code=%s api=%d..%d arch=%d abis=%zu p16=%d size=%llu usize=%llu apks=%d perms=%d/%d dex=%d/%llu/%llu comp=%s agp=%s\n",
+            f.have, f.package.c_str(), f.version.c_str(), f.version_code.c_str(), f.min_sdk, f.target_sdk, f.arch_state, f.abis.size(), f.page16,
+            (unsigned long long)f.size, (unsigned long long)f.usize, f.apk_count, f.perms, f.perms_danger, f.dex_files, (unsigned long long)f.dex_classes, (unsigned long long)f.dex_methods, f.compiler.c_str(), f.agp.c_str());
+        for (auto& it : r.items) out += strf("%d %d %c%c [%s] [%s] {%s} <%s:%d>\n", it.kind, it.ind, it.mono ? 'M' : '-', it.strong ? 'S' : '-', it.key.c_str(), it.value.c_str(), it.note.c_str(), it.tag.c_str(), it.tag_kind);
+    }
     fwrite(out.data(), 1, out.size(), stdout);
     if (icon_out && !r.icon.empty()) { FILE* f = fopen(icon_out, "wb"); if (f) { fwrite(r.icon.data(), 1, r.icon.size(), f); fclose(f); } }
     return r.ok ? 0 : 1;

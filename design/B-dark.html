@@ -1,0 +1,115 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>APK Lister — вариант B: карточки (тёмная тема)</title>
+<style>
+/* Variant B: owner-drawn view (GDI: FillRect / RoundRect / DrawText), Segoe UI, tabular digits. */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:900px;height:700px;overflow:hidden}
+body{font-family:"Segoe UI","Noto Sans",sans-serif;color:#1f2328;background:#f3f5f7;position:relative;font-variant-numeric:tabular-nums}
+.hdr{height:96px;background:#fff;border-bottom:1px solid #dfe3e8;display:flex;align-items:center;padding:0 18px;gap:16px;position:relative}
+.hdr img{width:64px;height:64px}
+.t{font-size:23px;font-weight:600;line-height:28px}
+.s{font-size:12.5px;color:#59636e;margin-top:2px}
+.chips{margin-top:8px;display:flex;gap:6px;flex-wrap:nowrap}
+.chip{font-size:11.5px;line-height:21px;padding:0 9px;border-radius:5px;font-weight:600;white-space:nowrap}
+.g{background:#e3f6e8;color:#14692e}.b{background:#e1efff;color:#0a4f9a}.o{background:#fff0e0;color:#9a4300}.gr{background:#eef1f4;color:#4b5560}
+.ver{position:absolute;right:16px;top:9px;font-size:11px;color:#8c959f}
+.wrap{position:absolute;top:96px;left:0;right:17px;bottom:0;padding:12px 12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;align-content:start;overflow:hidden}
+.card{background:#fff;border:1px solid #e1e5ea;border-radius:7px;padding:10px 12px 10px 12px}
+.ct{font-size:11.5px;font-weight:700;letter-spacing:.06em;color:#5b6570;text-transform:uppercase;display:flex;justify-content:space-between;margin-bottom:7px}
+.ct span{font-weight:600;letter-spacing:0;text-transform:none;color:#8c959f}
+.row{display:flex;font-size:12.5px;line-height:20px}
+.row .k{width:118px;color:#6e7781;flex:none}
+.row .v{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mut{color:#8c959f}
+.mono{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}
+.abi{display:flex;align-items:center;font-size:12.5px;line-height:22px}
+.abi b{width:96px;font-weight:600}
+.abi .bit{font-size:10.5px;font-weight:700;border-radius:4px;padding:0 6px;line-height:17px;margin-right:10px}
+.b64{background:#e3f6e8;color:#14692e}.b32{background:#eef1f4;color:#4b5560}
+.abi .ok{margin-left:auto;color:#1a7f37;font-size:11.5px;font-weight:600}
+.bar{display:flex;height:8px;border-radius:4px;overflow:hidden;margin:2px 0 8px}
+.bar i{display:block}
+.leg{display:flex;gap:12px;font-size:11.5px;color:#59636e;margin-bottom:6px}
+.leg i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
+.p{display:flex;font-size:12px;line-height:20px;justify-content:space-between}
+.p .n{font-family:Consolas,"Cascadia Mono",monospace;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag{font-size:10.5px;font-weight:700;border-radius:4px;padding:0 6px;line-height:17px;margin-top:1.5px;flex:none}
+.d{background:#ffe8e6;color:#c4231c}.sp{background:#fff0e0;color:#9a4300}
+.badges{display:flex;flex-wrap:wrap;gap:5px}
+.bd{font-size:11.5px;line-height:21px;padding:0 8px;border-radius:5px;background:#f0f3f6;color:#2f3740;font-weight:600;white-space:nowrap}
+.bd.fw{background:#e1efff;color:#0a4f9a}.bd.lang{background:#f3e8ff;color:#6f2dbd}.bd.jp{background:#e3f6e8;color:#14692e}
+.big{display:flex;gap:18px;margin-bottom:6px}
+.big div{font-size:11px;color:#6e7781}
+.big b{display:block;font-size:18px;color:#1f2328;font-weight:600;line-height:22px}
+.vs{position:absolute;right:0;top:96px;width:17px;bottom:0;background:#f0f0f0;border-left:1px solid #e3e3e3}
+.vs i{position:absolute;left:3px;right:3px;top:18px;height:120px;background:#c2c2c2;border-radius:2px}
+
+/* ---- dark theme overrides */
+body{background:#16191d;color:#e6e8eb}
+.hdr{background:#1f2328;border-bottom-color:#30363d}
+.s{color:#9aa4ae}.ver{color:#6e7781}
+.g,.b64{background:#13361f;color:#7ee2a0}.b{background:#0f2f52;color:#8cc4ff}.o{background:#3d2410;color:#ffb27a}.gr,.b32{background:#2a3038;color:#b4bdc7}
+.card{background:#1f2328;border-color:#30363d}
+.ct{color:#9aa4ae}.ct span,.mut{color:#7d8792}
+.row .k{color:#8b949e}
+.abi .ok{color:#56d364}
+.leg{color:#9aa4ae}
+.d{background:#4a1714;color:#ff8e86}.sp{background:#3d2410;color:#ffb27a}
+.bd{background:#2a3038;color:#d0d7de}.bd.fw{background:#0f2f52;color:#8cc4ff}.bd.lang{background:#2e1d4a;color:#c9a6ff}.bd.jp{background:#13361f;color:#7ee2a0}
+.big b{color:#f0f3f6}
+.vs{background:#1f2328;border-left-color:#30363d}.vs i{background:#484f58}
+.hdr img{background:#fff;border-radius:14px;padding:4px}
+</style></head><body>
+<div class="hdr"><img src="fdroid-icon.png">
+ <div style="min-width:0"><div class="t">F-Droid</div><div class="s">org.fdroid.fdroid &nbsp;·&nbsp; версия 2.0.2 (2000052) &nbsp;·&nbsp; APK, 11.99 МиБ</div>
+ <div class="chips"><span class="chip g">arm64-v8a</span><span class="chip g">x86_64</span><span class="chip gr">armeabi-v7a</span><span class="chip gr">x86</span><span class="chip b">API 24 → 37</span><span class="chip o">8 опасных разрешений</span><span class="chip gr">R8 · release</span></div></div>
+ <div class="ver">APK Lister 0.1.2</div></div>
+<div class="wrap">
+ <div class="card"><div class="ct">Пакет</div>
+  <div class="row"><div class="k">Имя пакета</div><div class="v mono">org.fdroid.fdroid</div></div>
+  <div class="row"><div class="k">Версия</div><div class="v">2.0.2 <span class="mut">· код 2000052</span></div></div>
+  <div class="row"><div class="k">Мин. SDK</div><div class="v">24 <span class="mut">· Android 7.0 Nougat</span></div></div>
+  <div class="row"><div class="k">Целевой SDK</div><div class="v">37 <span class="mut">· Android 17</span></div></div>
+  <div class="row"><div class="k">SDK компиляции</div><div class="v">37 <span class="mut">· codename 17</span></div></div>
+  <div class="row"><div class="k">Application</div><div class="v mono">org.fdroid.App</div></div>
+  <div class="row"><div class="k">Тема</div><div class="v mono">@style/Theme.FDroid</div></div>
+  <div class="row"><div class="k">Установка</div><div class="v mut">по умолчанию internalOnly</div></div>
+ </div>
+ <div class="card"><div class="ct">Архитектура <span>4 ABI · страницы 16 КБ готовы</span></div>
+  <div class="abi"><b>arm64-v8a</b><span class="bit b64">64-бит</span><span class="mut mono">ELF AArch64 · 9.9 КиБ</span><span class="ok">16 КБ ✓</span></div>
+  <div class="abi"><b>x86_64</b><span class="bit b64">64-бит</span><span class="mut mono">ELF x86-64 · 10.5 КиБ</span><span class="ok">16 КБ ✓</span></div>
+  <div class="abi"><b>armeabi-v7a</b><span class="bit b32">32-бит</span><span class="mut mono">ELF ARM · 7.1 КиБ</span></div>
+  <div class="abi"><b>x86</b><span class="bit b32">32-бит</span><span class="mut mono">ELF x86 · 9.1 КиБ</span></div>
+  <div class="row" style="margin-top:4px"><div class="k">Библиотеки</div><div class="v mono">libandroidx.graphics.path.so</div></div>
+  <div class="row"><div class="k">NDK</div><div class="v">r25c <span class="mut">· api 21 · extractNativeLibs=false</span></div></div>
+ </div>
+ <div class="card"><div class="ct">Разрешения <span>31 запрошено</span></div>
+  <div class="bar"><i style="width:25.8%;background:#e5534b"></i><i style="width:12.9%;background:#f0883e"></i><i style="width:51.6%;background:#3b82c4"></i><i style="width:9.7%;background:#57606a"></i></div>
+  <div class="leg"><span><i style="background:#e5534b"></i>опасных 8</span><span><i style="background:#f0883e"></i>спец. 4</span><span><i style="background:#3b82c4"></i>обычных 16</span><span><i style="background:#57606a"></i>прочих 3</span></div>
+  <div class="p"><span class="n">CAMERA</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">POST_NOTIFICATIONS</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">BLUETOOTH_CONNECT · SCAN · ADVERTISE</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">READ/WRITE_EXTERNAL_STORAGE</span><span class="tag d">опасное</span></div>
+  <div class="p"><span class="n">MANAGE_EXTERNAL_STORAGE</span><span class="tag sp">спец. доступ</span></div>
+  <div class="p"><span class="n">REQUEST_INSTALL_PACKAGES</span><span class="tag sp">спец. доступ</span></div>
+ </div>
+ <div class="card"><div class="ct">Технологии <span>эвристика</span></div>
+  <div class="badges">
+   <span class="bd lang">Kotlin</span><span class="bd lang">C/C++ (NDK)</span><span class="bd fw">Compose Multiplatform</span>
+   <span class="bd jp">Jetpack Compose</span><span class="bd jp">Room</span><span class="bd jp">WorkManager</span><span class="bd">Material</span>
+   <span class="bd">Coroutines</span><span class="bd">kotlinx.serialization</span><span class="bd">OkHttp</span><span class="bd">Ktor</span><span class="bd">Dagger</span><span class="bd">Hilt</span>
+   <span class="bd">Glide</span><span class="bd">Coil 3</span><span class="bd">ZXing</span><span class="bd">Bouncy Castle</span><span class="bd">Apache Commons</span>
+  </div>
+  <div class="row" style="margin-top:8px"><div class="k">Сборка</div><div class="v">AGP 9.2.1 <span class="mut">· git 08f4447</span></div></div>
+ </div>
+ <div class="card"><div class="ct">DEX <span>3 файла · 19.63 МиБ</span></div>
+  <div class="big"><div><b>24 528</b>классов</div><div><b>139 895</b>методов</div><div><b>60 340</b>полей</div></div>
+  <div class="row"><div class="k">Компилятор</div><div class="v">R8 9.2.14 <span class="mut">· full · min-api 24</span></div></div>
+ </div>
+ <div class="card"><div class="ct">Ресурсы <span>resources.arsc</span></div>
+  <div class="row"><div class="k">Локали</div><div class="v">45 <span class="mut">· ru uk be de fr es ja zh…</span></div></div>
+  <div class="row"><div class="k">Плотности</div><div class="v">ldpi … xxxhdpi, anydpi</div></div>
+  <div class="row"><div class="k">ZIP</div><div class="v">973 записи <span class="mut">· zipalign ✓</span></div></div>
+ </div>
+</div>
+<div class="vs"><i></i></div>
+</body></html>

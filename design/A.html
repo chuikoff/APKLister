@@ -1,0 +1,68 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>APK Lister — вариант A: подшлифованный текст</title>
+<style>
+/* Variant A: one read-only RichEdit with RTF colors/bold/char background + a GDI-painted header. */
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:900px;height:700px;overflow:hidden;background:#fff}
+body{font-family:"Segoe UI","Noto Sans",sans-serif;color:#1f2328;position:relative}
+.hdr{height:92px;background:#f6f8fa;border-bottom:1px solid #d8dee4;display:flex;align-items:center;padding:0 16px;gap:14px;position:relative}
+.hdr img{width:64px;height:64px}
+.t{font-size:22px;font-weight:600;line-height:28px}
+.s{font-size:12.5px;color:#57606a;margin-top:1px}
+.chips{margin-top:7px;display:flex;gap:6px}
+.chip{font-size:12px;line-height:20px;padding:0 8px;border-radius:10px;font-weight:600}
+.c-arch{background:#dafbe1;color:#116329}
+.c-sdk{background:#ddf4ff;color:#0a4f8a}
+.c-perm{background:#fff1e5;color:#953800}
+.ver{position:absolute;right:14px;top:8px;font-size:11.5px;color:#8c959f}
+.body{position:absolute;top:92px;left:0;right:17px;bottom:17px;overflow:hidden;padding:8px 12px 0 12px;
+  font-family:Consolas,"Cascadia Mono","Cascadia Code",monospace;font-size:13px;line-height:17px;white-space:pre}
+.sec{color:#0969da;font-weight:700;margin-top:9px;margin-bottom:2px}
+.sec:first-child{margin-top:0}
+.sec .n{color:#8c959f;font-weight:400}
+.k{color:#6e7781}
+.v{color:#1f2328}
+.hl{background:#dafbe1;color:#116329;font-weight:700}
+.hb{background:#ddf4ff;color:#0a4f8a;font-weight:700}
+.dng{color:#cf222e;font-weight:700}
+.dngb{background:#ffebe9;color:#cf222e;font-weight:700}
+.spc{background:#fff1e5;color:#953800;font-weight:700}
+.mut{color:#8c959f}
+.ok{color:#1a7f37;font-weight:700}
+/* fake scrollbars (Windows classic, as in the EDIT control) */
+.vs{position:absolute;right:0;top:92px;width:17px;bottom:17px;background:#f0f0f0;border-left:1px solid #e3e3e3}
+.vs i{position:absolute;left:3px;right:3px;top:20px;height:70px;background:#c2c2c2;border-radius:2px}
+.hs{position:absolute;left:0;right:0;bottom:0;height:17px;background:#f0f0f0;border-top:1px solid #e3e3e3}
+</style></head><body>
+<div class="hdr"><img src="fdroid-icon.png">
+ <div><div class="t">F-Droid</div><div class="s">org.fdroid.fdroid · v2.0.2 (2000052) · APK · 11.99 МиБ</div>
+ <div class="chips"><span class="chip c-arch">arm64-v8a · armeabi-v7a · x86_64 · x86</span><span class="chip c-sdk">API 24 → 37</span><span class="chip c-perm">8 опасных разрешений</span></div></div>
+ <div class="ver">APK Lister 0.1.2</div></div>
+<div class="body"><div class="sec">ПАКЕТ</div><span class="k">  Имя пакета                    </span><span class="v">org.fdroid.fdroid</span>
+<span class="k">  Название                      </span><span class="v">F-Droid</span><span class="mut">   (@string/app_name)</span>
+<span class="k">  Версия                        </span><span class="v">2.0.2</span><span class="mut">   код 2000052</span>
+<span class="k">  Архитектура                   </span><span class="hl"> 64-бит: arm64-v8a, x86_64 </span> <span class="hl"> 32-бит: armeabi-v7a, x86 </span>
+<span class="k">  Мин. SDK                      </span><span class="hb"> 24 </span><span class="v"> Android 7.0 Nougat</span>
+<span class="k">  Целевой SDK                   </span><span class="hb"> 37 </span><span class="v"> Android 17</span>
+<span class="k">  SDK компиляции                </span><span class="v">37 (Android 17)</span><span class="mut">  codename 17</span>
+<span class="k">  Место установки               </span><span class="mut">не задано · по умолчанию internalOnly</span>
+<span class="k">  Класс Application             </span><span class="v">org.fdroid.App</span>
+<span class="k">  Тема                          </span><span class="v">@style/Theme.FDroid</span>
+<span class="k">  debuggable                    </span><span class="mut">не задано · false</span>
+<span class="k">  usesCleartextTraffic          </span><span class="spc"> true </span>
+<span class="k">  extractNativeLibs             </span><span class="v">false</span>
+<div class="sec">РАЗРЕШЕНИЯ <span class="n">31 · опасных 8 · спец. 4 · обычных 16 · прочих 3</span></div><span class="v">  android.permission.CAMERA                                 </span><span class="dngb"> ОПАСНОЕ </span>
+<span class="v">  android.permission.POST_NOTIFICATIONS                     </span><span class="dngb"> ОПАСНОЕ </span>
+<span class="v">  android.permission.BLUETOOTH_SCAN                         </span><span class="dngb"> ОПАСНОЕ </span><span class="mut">  neverForLocation</span>
+<span class="v">  android.permission.ACCESS_COARSE_LOCATION                 </span><span class="dngb"> ОПАСНОЕ </span><span class="mut">  maxSdkVersion=30</span>
+<span class="v">  android.permission.MANAGE_EXTERNAL_STORAGE                </span><span class="spc"> спец. доступ </span>
+<span class="v">  android.permission.REQUEST_INSTALL_PACKAGES               </span><span class="spc"> спец. доступ </span>
+<span class="v">  android.permission.INTERNET                               </span><span class="mut">обычное</span>
+<span class="v">  android.permission.ACCESS_NETWORK_STATE                   </span><span class="mut">обычное</span>
+<div class="sec">НАТИВНЫЕ БИБЛИОТЕКИ <span class="n">4 ABI</span></div><span class="v">  arm64-v8a    libandroidx.graphics.path.so    9.9 КиБ  ELF64 AArch64  NDK r25c  </span><span class="ok">16 КБ ✓</span>
+<span class="v">  x86_64       libandroidx.graphics.path.so   10.5 КиБ  ELF64 x86-64   NDK r25c  </span><span class="ok">16 КБ ✓</span>
+<div class="sec">DEX <span class="n">3 файла · 19.63 МиБ</span></div><span class="k">  Итого                         </span><span class="v">классов 24 528 · методов 139 895 · полей 60 340</span>
+<span class="k">  Компилятор                    </span><span class="v">R8 9.2.14 · full · release · min-api 24</span>
+<div class="sec">ТЕХНОЛОГИИ</div><span class="v">  </span><span class="hb"> Kotlin </span> <span class="hb"> Jetpack Compose </span> <span class="hb"> Compose Multiplatform </span> <span class="hb"> Room </span> <span class="hb"> WorkManager </span> <span class="hb"> Hilt </span> <span class="hb"> Ktor </span> <span class="hb"> OkHttp </span>
+</div>
+<div class="vs"><i></i></div><div class="hs"></div>
+</body></html>

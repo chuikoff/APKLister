@@ -88,6 +88,16 @@ static const char* const kRu[][2] = {
     {"country set", "набор стран"}, {"unspecified", "не указано"}, {"no ", "без "},
     {"DANGEROUS", "ОПАСНОЕ"}, {"special access", "спец. доступ"}, {"signature/privileged", "подпись/системное"},
     {"normal", "обычное"}, {"other/custom", "прочее/своё"}, {"current development", "в разработке"},
+    {"16 KB ✓", "16 КБ ✓"}, {"16 KB ✗", "16 КБ ✗"},
+    // ---- view (hero, tiles, menu)
+    {"Version", "Версия"}, {"API", "API"}, {"Size", "Размер"}, {"Permissions", "Разрешения"}, {"DEX", "DEX"},
+    {"code %s", "код %s"}, {"Android %s → %s", "Android %s → %s"}, {"%s uncompressed", "%s без сжатия"}, {"%d APK files", "APK-файлов: %d"},
+    {"dangerous: %d", "из них опасных %d"}, {"no dangerous", "опасных нет"}, {"methods · %d files", "методов · файлов %d"},
+    {"%s classes", "классов %s"}, {"16 KB pages ✓", "16 КБ страницы ✓"}, {"16 KB pages ✗", "16 КБ страницы ✗"},
+    {"%d ABI", "%d ABI"}, {"no native code", "нет нативного кода"}, {"in splits", "в сплитах"}, {"open the whole XAPK/APKS", "откройте XAPK/APKS целиком"},
+    {".so outside lib/", ".so вне lib/"}, {"no DEX", "нет DEX"},
+    {"Copy line", "Копировать строку"}, {"Copy value", "Копировать значение"}, {"Copy selection", "Копировать выделенное"}, {"Copy all", "Копировать всё"},
+    {"Select all", "Выделить всё"},
     // ---- architecture
     {"64-bit ARM", "64-бит ARM"}, {"32-bit ARM", "32-бит ARM"}, {"32-bit ARM, ARMv5/v6, legacy", "32-бит ARM, ARMv5/v6, устаревшая"},
     {"64-bit x86", "64-бит x86"}, {"32-bit x86", "32-бит x86"}, {"64-bit RISC-V", "64-бит RISC-V"},

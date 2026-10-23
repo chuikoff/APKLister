@@ -109,7 +109,9 @@ libgcc/libstdc++ линкуются статически, DLL зависят т�
 
 ### Лицензия
 
-Предлагается **GPL-2.0-or-later** (см. `LICENSE`) — это предложение, лицензию можно сменить до публикации.
+**GPL-2.0-or-later** (см. `LICENSE`).
+
+Образцы в `samples/`: `org.billthefarmer.editor.apk` — приложение [Editor](https://github.com/billthefarmer/editor) (GPL-3.0), `demo.*` — синтетические бандлы, собранные bundletool. Иконка F‑Droid в `design/` — © F‑Droid (CC BY-SA 3.0 / GPL-3.0+), используется в макетах.
 
 ---
 
@@ -152,4 +154,6 @@ Signatures and components are not shown; `toc.pb` not decoded; encrypted APKM un
 
 ### License
 
-Proposed: **GPL-2.0-or-later** (see `LICENSE`). This is a proposal and can be changed before publishing.
+**GPL-2.0-or-later** (see `LICENSE`).
+
+Samples: `samples/org.billthefarmer.editor.apk` is [Editor](https://github.com/billthefarmer/editor) (GPL-3.0); `samples/demo.*` are synthetic bundles built with bundletool. The F‑Droid icon in `design/` is © F‑Droid (CC BY-SA 3.0 / GPL-3.0+), used in mockups.
